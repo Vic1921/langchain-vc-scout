@@ -81,7 +81,7 @@ def scrape_headlines(url: str) -> str:
 # ---------------------------
 model = init_chat_model(
     "claude-sonnet-4-6",
-    temperature=0,
+    temperature=0.3,
     max_tokens=900,
     timeout=30,
 )
