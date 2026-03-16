@@ -122,7 +122,7 @@ agent = create_agent(
 # 7) HELPER FUNCTION TO SAVE MARKDOWN REPORT
 # ---------------------------
 def save_markdown_report(url: str, result) -> str:
-    outputs_dir = Path("outputs")
+    outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
     outputs_dir.mkdir(exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
