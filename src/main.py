@@ -1,5 +1,6 @@
 import os
 import requests
+# import uuid
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from dotenv import load_dotenv
@@ -12,6 +13,11 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 load_dotenv()
 
+SOURCES = [
+    "https://techcrunch.com/category/startups/",
+    "https://techcrunch.com/category/artificial-intelligence/",
+]
+
 # ---------------------------
 # 1) SYSTEM PROMPT
 # ---------------------------
@@ -23,8 +29,15 @@ Your job is to:
 2. Identify the most relevant items for an early-stage software investor.
 3. Summarize the key developments clearly.
 4. Produce concise, structured investment-style output.
+5. Identify recurring themes
+6. Rank investable areas
+7. Point out noise vs real signal
+8. Implement a scoring mechanism for each company/startup based on factors like market potential, team strength, product innovation, defensibility, and overall investor interest. 
+Provide a final score for each company/startup to help prioritize investment opportunities.
 
-Be practical, specific, and avoid hype.
+
+
+Be practical, specific, and avoid hype adn corporate fluff-like phrases, I need concrete, actionable advice.
 If the source looks noisy or low quality, say so.
 """
 
@@ -109,7 +122,8 @@ def run_agent(url: str):
     config = {"configurable": {"thread_id": "vc-scout-1"}}
 
     # Reusing the same thread means that the convo always start from the same checkpoint (in the same thread)
-    # Could/should be changed further down the line
+    # Could/should be replaced further down the line with the down below line
+    # config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
     user_prompt = f"""
     Please analyze this source for a software-focused VC:
@@ -142,6 +156,5 @@ def run_agent(url: str):
 
 
 if __name__ == "__main__":
-    # Replace with a real startup / AI news page you want to test
-    test_url = "https://techcrunch.com/category/startups/"
-    run_agent(test_url)
+    for url in SOURCES:
+        run_agent(url)
