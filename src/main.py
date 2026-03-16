@@ -4,6 +4,8 @@ import requests
 from bs4 import BeautifulSoup
 from dataclasses import dataclass
 from dotenv import load_dotenv
+from pathlib import Path
+from datetime import datetime
 
 from langchain.agents import create_agent
 from langchain.chat_models import init_chat_model
@@ -117,14 +119,41 @@ agent = create_agent(
 )
 
 # ---------------------------
-# 7) RUN
+# 7) HELPER FUNCTION TO SAVE MARKDOWN REPORT
+# ---------------------------
+def save_markdown_report(url: str, result) -> str:
+    outputs_dir = Path("outputs")
+    outputs_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = outputs_dir / f"vc_scout_report_{timestamp}.md"
+
+    markdown_content = f"""# VC Scout Report
+
+**Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+**Source URL:** {url}
+
+## Headline Summary
+{result.headline_summary}
+
+## Why It Matters
+{result.why_it_matters}
+
+## Possible Investment Angle
+{result.possible_investment_angle}
+
+## Risks or Limitations
+{result.risks_or_limitations}
+"""
+
+    filename.write_text(markdown_content, encoding="utf-8")
+    return str(filename)
+
+# ---------------------------
+# 8) RUN
 # ---------------------------
 def run_agent(url: str):
     config = {"configurable": {"thread_id": "vc-scout-1"}}
-
-    # Reusing the same thread means that the convo always start from the same checkpoint (in the same thread)
-    # Could/should be replaced further down the line with the down below line
-    # config = {"configurable": {"thread_id": str(uuid.uuid4())}}
 
     user_prompt = f"""
     Please analyze this source for a software-focused VC:
@@ -136,7 +165,6 @@ def run_agent(url: str):
     - why it matters
     - a possible investment angle
     - risks or limitations
-    - list with scoring decisions and bullet point explanation for each of the scoring criteria
     """
 
     response = agent.invoke(
@@ -157,6 +185,10 @@ def run_agent(url: str):
     print(result.risks_or_limitations)
     print("\nList with scoring decisions:")
     print(result.list_with_scoring_decisions)
+
+    saved_file = save_markdown_report(url, result)
+    print(f"\nMarkdown report saved to: {saved_file}")
+
 
 
 if __name__ == "__main__":
