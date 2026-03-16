@@ -153,7 +153,7 @@ def save_markdown_report(url: str, result) -> str:
 # 8) RUN
 # ---------------------------
 def run_agent(url: str):
-    config = {"configurable": {"thread_id": "vc-scout-1"}}
+    config = {"configurable": {"thread_id": datetime.now().strftime("%Y%m%d_%H%M%S")}}
 
     user_prompt = f"""
     Please analyze this source for a software-focused VC:
