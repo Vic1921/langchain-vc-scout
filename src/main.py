@@ -108,6 +108,9 @@ agent = create_agent(
 def run_agent(url: str):
     config = {"configurable": {"thread_id": "vc-scout-1"}}
 
+    # Reusing the same thread means that the convo always start from the same checkpoint (in the same thread)
+    # Could/should be changed further down the line
+
     user_prompt = f"""
     Please analyze this source for a software-focused VC:
     {url}
