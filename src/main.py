@@ -50,6 +50,7 @@ class VCScoutOutput:
     why_it_matters: str
     possible_investment_angle: str
     risks_or_limitations: str
+    list_with_scoring_decisions: str
 
 # ---------------------------
 # 3) TOOL: SCRAPE HEADLINES
@@ -135,6 +136,7 @@ def run_agent(url: str):
     - why it matters
     - a possible investment angle
     - risks or limitations
+    - list with scoring decisions and bullet point explanation for each of the scoring criteria
     """
 
     response = agent.invoke(
@@ -153,6 +155,8 @@ def run_agent(url: str):
     print(result.possible_investment_angle)
     print("\nRisks or limitations:")
     print(result.risks_or_limitations)
+    print("\nList with scoring decisions:")
+    print(result.list_with_scoring_decisions)
 
 
 if __name__ == "__main__":
