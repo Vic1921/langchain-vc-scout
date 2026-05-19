@@ -26,21 +26,16 @@ SOURCES = [
 SYSTEM_PROMPT = """
 You are a sharp junior VC research assistant.
 
-Your job is to:
-1. Read startup / AI headlines from the provided source.
-2. Identify the most relevant items for an early-stage software investor.
-3. Summarize the key developments clearly.
-4. Produce concise, structured investment-style output.
-5. Identify recurring themes
-6. Rank investable areas
-7. Point out noise vs real signal
-8. Implement a scoring mechanism for each company/startup based on factors like market potential, team strength, product innovation, defensibility, and overall investor interest. 
-Provide a final score for each company/startup to help prioritize investment opportunities.
+You will be given MULTIPLE sources to analyze in a single pass. You MUST:
+1. Call scrape_headlines exactly once per source URL provided.
+2. Synthesize ACROSS the sources rather than producing per-source summaries — the value is in cross-source signal.
+3. Explicitly flag any signal that is only visible when sources are read together (e.g. a company appears in two feeds; a theme spikes across sources; one source contradicts another).
+4. Identify recurring themes and rank investable areas.
+5. Point out noise vs real signal, and call out source quality issues if any source looks thin or PR-driven.
+6. Score every distinct company/startup observed on (market potential, team strength, product innovation, defensibility, investor interest). Tag each scored item with the source(s) it came from so claims are auditable.
 
-
-
-Be practical, specific, and avoid hype adn corporate fluff-like phrases, I need concrete, actionable advice.
-If the source looks noisy or low quality, say so.
+Be practical, specific, and avoid hype and corporate fluff-like phrases — concrete, actionable advice only.
+If the combined sources look noisy or low quality, say so plainly.
 """
 
 # ---------------------------
@@ -89,8 +84,10 @@ def scrape_headlines(url: str) -> str:
             seen.add(t)
             unique_texts.append(t)
 
-    # Keep first 20 useful lines
-    return "\n".join(unique_texts[:20])
+    # Keep first 20 useful lines, prefixed with the source URL so the
+    # agent can attribute every headline back to its origin during synthesis.
+    body = "\n".join(unique_texts[:20]) if unique_texts else "(no headlines extracted)"
+    return f"=== SOURCE: {url} ===\n{body}"
 
 # ---------------------------
 # 4) MODEL SETUP
@@ -98,8 +95,8 @@ def scrape_headlines(url: str) -> str:
 model = init_chat_model(
     "claude-sonnet-4-6",
     temperature=0.3,
-    max_tokens=900,
-    timeout=30,
+    max_tokens=2500,
+    timeout=60,
 )
 
 # ---------------------------
@@ -121,17 +118,21 @@ agent = create_agent(
 # ---------------------------
 # 7) HELPER FUNCTION TO SAVE MARKDOWN REPORT
 # ---------------------------
-def save_markdown_report(url: str, result) -> str:
+def save_markdown_report(urls: list[str], result) -> str:
     outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
     outputs_dir.mkdir(exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     filename = outputs_dir / f"vc_scout_report_{timestamp}.md"
 
+    sources_block = "\n".join(f"- {u}" for u in urls)
+
     markdown_content = f"""# VC Scout Report
 
 **Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-**Source URL:** {url}
+
+## Sources Analyzed
+{sources_block}
 
 ## Headline Summary
 {result.headline_summary}
@@ -144,6 +145,9 @@ def save_markdown_report(url: str, result) -> str:
 
 ## Risks or Limitations
 {result.risks_or_limitations}
+
+## Scored Companies / Startups
+{result.list_with_scoring_decisions}
 """
 
     filename.write_text(markdown_content, encoding="utf-8")
@@ -152,19 +156,26 @@ def save_markdown_report(url: str, result) -> str:
 # ---------------------------
 # 8) RUN
 # ---------------------------
-def run_agent(url: str):
+def run_agent(urls: list[str]):
     config = {"configurable": {"thread_id": datetime.now().strftime("%Y%m%d_%H%M%S")}}
 
+    sources_block = "\n".join(f"- {u}" for u in urls)
     user_prompt = f"""
-    Please analyze this source for a software-focused VC:
-    {url}
+    Analyze the following sources for a software-focused VC. Call scrape_headlines
+    once per URL, then produce ONE combined analysis synthesized across all sources
+    (not a per-source list).
 
-    Use the scrape_headlines tool first.
-    Then return:
-    - a concise headline summary
-    - why it matters
-    - a possible investment angle
-    - risks or limitations
+    Sources:
+    {sources_block}
+
+    Return:
+    - headline_summary: cross-source synthesis of what's happening
+    - why_it_matters: what only becomes visible when these sources are read together
+    - possible_investment_angle: prioritized theses informed by all sources
+    - risks_or_limitations: include data gaps and source bias
+    - list_with_scoring_decisions: every distinct company/startup observed, one per line,
+      each tagged with its source(s) and scored 1-10 across
+      (market potential, team strength, product innovation, defensibility, investor interest).
     """
 
     response = agent.invoke(
@@ -175,7 +186,10 @@ def run_agent(url: str):
     result = response["structured_response"]
 
     print("\n=== VC SCOUT NOTE ===\n")
-    print("Headline summary:")
+    print("Sources analyzed:")
+    for u in urls:
+        print(f"  - {u}")
+    print("\nHeadline summary:")
     print(result.headline_summary)
     print("\nWhy it matters:")
     print(result.why_it_matters)
@@ -186,11 +200,10 @@ def run_agent(url: str):
     print("\nList with scoring decisions:")
     print(result.list_with_scoring_decisions)
 
-    saved_file = save_markdown_report(url, result)
+    saved_file = save_markdown_report(urls, result)
     print(f"\nMarkdown report saved to: {saved_file}")
-
+    return result
 
 
 if __name__ == "__main__":
-    for url in SOURCES:
-        run_agent(url)
+    run_agent(SOURCES)
