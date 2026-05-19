@@ -1,209 +1,170 @@
-import os
-import requests
-# import uuid
-from bs4 import BeautifulSoup
-from dataclasses import dataclass
-from dotenv import load_dotenv
-from pathlib import Path
+"""VC Scout entry point.
+
+Modes:
+- (default)  : full run — scrape sources, synthesize, save MD + PDF, persist
+               to SQLite, emit daily digest, fire urgent alerts and theme spikes.
+- --urgent   : run cheaply for intra-day cron — same scrape + synthesis, but
+               only emits the URGENT tier (watchlist hits + funding signals).
+               Skips daily digest and PDF generation.
+- --timeline NAME      : print every recorded mention of a company across runs.
+- --theme-velocity     : print themes ranked by recent-vs-prior mention count.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
 from datetime import datetime
 
-from langchain.agents import create_agent
-from langchain.chat_models import init_chat_model
-from langchain.tools import tool
-from langchain.agents.structured_output import ToolStrategy
-from langgraph.checkpoint.memory import InMemorySaver
+from dotenv import load_dotenv
+
+from .agent import build_agent
+from .alerts import (
+    find_theme_spikes,
+    find_urgent,
+    load_watchlist,
+    send_daily_digest,
+    send_theme_spike,
+    send_urgent_alert,
+)
+from .reports import generate_onepagers, save_markdown_report
+from .sources import DEFAULT_SOURCES
+from .storage import company_timeline, record_run, theme_velocity
+
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("scout")
 
-SOURCES = [
-    "https://techcrunch.com/category/startups/",
-    "https://techcrunch.com/category/artificial-intelligence/",
-]
 
-# ---------------------------
-# 1) SYSTEM PROMPT
-# ---------------------------
-SYSTEM_PROMPT = """
-You are a sharp junior VC research assistant.
+def _user_prompt(urls: list[str]) -> str:
+    sources_block = "\n".join(f"    - {u}" for u in urls)
+    return f"""
+Analyze the following sources for a European software-focused VC. Call
+scrape_headlines once per URL, then produce ONE combined analysis synthesized
+across all sources (not a per-source list).
 
-You will be given MULTIPLE sources to analyze in a single pass. You MUST:
-1. Call scrape_headlines exactly once per source URL provided.
-2. Synthesize ACROSS the sources rather than producing per-source summaries — the value is in cross-source signal.
-3. Explicitly flag any signal that is only visible when sources are read together (e.g. a company appears in two feeds; a theme spikes across sources; one source contradicts another).
-4. Identify recurring themes and rank investable areas.
-5. Point out noise vs real signal, and call out source quality issues if any source looks thin or PR-driven.
-6. Score every distinct company/startup observed on (market potential, team strength, product innovation, defensibility, investor interest). Tag each scored item with the source(s) it came from so claims are auditable.
-
-Be practical, specific, and avoid hype and corporate fluff-like phrases — concrete, actionable advice only.
-If the combined sources look noisy or low quality, say so plainly.
-"""
-
-# ---------------------------
-# 2) STRUCTURED OUTPUT SCHEMA
-# ---------------------------
-@dataclass
-class VCScoutOutput:
-    headline_summary: str
-    why_it_matters: str
-    possible_investment_angle: str
-    risks_or_limitations: str
-    list_with_scoring_decisions: str
-
-# ---------------------------
-# 3) TOOL: SCRAPE HEADLINES
-# ---------------------------
-@tool
-def scrape_headlines(url: str) -> str:
-    """
-    Scrape visible headlines and article titles from a webpage.
-    Input should be a full URL.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "lxml")
-
-    texts = []
-
-    # Try common heading tags
-    for tag_name in ["h1", "h2", "h3", "title"]:
-        for tag in soup.find_all(tag_name):
-            text = tag.get_text(" ", strip=True)
-            if text and len(text) > 20:
-                texts.append(text)
-
-    # Deduplicate while preserving order
-    seen = set()
-    unique_texts = []
-    for t in texts:
-        if t not in seen:
-            seen.add(t)
-            unique_texts.append(t)
-
-    # Keep first 20 useful lines, prefixed with the source URL so the
-    # agent can attribute every headline back to its origin during synthesis.
-    body = "\n".join(unique_texts[:20]) if unique_texts else "(no headlines extracted)"
-    return f"=== SOURCE: {url} ===\n{body}"
-
-# ---------------------------
-# 4) MODEL SETUP
-# ---------------------------
-model = init_chat_model(
-    "claude-sonnet-4-6",
-    temperature=0.3,
-    max_tokens=2500,
-    timeout=60,
-)
-
-# ---------------------------
-# 5) MEMORY / CHECKPOINTER
-# ---------------------------
-checkpointer = InMemorySaver()
-
-# ---------------------------
-# 6) CREATE AGENT
-# ---------------------------
-agent = create_agent(
-    model=model,
-    system_prompt=SYSTEM_PROMPT,
-    tools=[scrape_headlines],
-    response_format=ToolStrategy(VCScoutOutput),
-    checkpointer=checkpointer,
-)
-
-# ---------------------------
-# 7) HELPER FUNCTION TO SAVE MARKDOWN REPORT
-# ---------------------------
-def save_markdown_report(urls: list[str], result) -> str:
-    outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
-    outputs_dir.mkdir(exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = outputs_dir / f"vc_scout_report_{timestamp}.md"
-
-    sources_block = "\n".join(f"- {u}" for u in urls)
-
-    markdown_content = f"""# VC Scout Report
-
-**Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-## Sources Analyzed
+Sources:
 {sources_block}
 
-## Headline Summary
-{result.headline_summary}
-
-## Why It Matters
-{result.why_it_matters}
-
-## Possible Investment Angle
-{result.possible_investment_angle}
-
-## Risks or Limitations
-{result.risks_or_limitations}
-
-## Scored Companies / Startups
-{result.list_with_scoring_decisions}
+Populate every field of the VCScoutOutput schema. In particular:
+- `visible_only_when_combined`: the mosaic-mode finding — what only emerges
+  from synthesis.
+- `contrarian_view`: a Howard-Marks pass on the consensus.
+- For each company: regulatory_tag, sovereignty_tag, vintage_match, and
+  funding_signal MUST be populated. Cite sources inline in the rationale
+  using `[source: <url>]`.
 """
 
-    filename.write_text(markdown_content, encoding="utf-8")
-    return str(filename)
 
-# ---------------------------
-# 8) RUN
-# ---------------------------
-def run_agent(urls: list[str]):
-    config = {"configurable": {"thread_id": datetime.now().strftime("%Y%m%d_%H%M%S")}}
-
-    sources_block = "\n".join(f"- {u}" for u in urls)
-    user_prompt = f"""
-    Analyze the following sources for a software-focused VC. Call scrape_headlines
-    once per URL, then produce ONE combined analysis synthesized across all sources
-    (not a per-source list).
-
-    Sources:
-    {sources_block}
-
-    Return:
-    - headline_summary: cross-source synthesis of what's happening
-    - why_it_matters: what only becomes visible when these sources are read together
-    - possible_investment_angle: prioritized theses informed by all sources
-    - risks_or_limitations: include data gaps and source bias
-    - list_with_scoring_decisions: every distinct company/startup observed, one per line,
-      each tagged with its source(s) and scored 1-10 across
-      (market potential, team strength, product innovation, defensibility, investor interest).
-    """
+def run(urls: list[str], urgent_only: bool = False) -> int:
+    agent = build_agent()
+    thread_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    config = {"configurable": {"thread_id": thread_id}}
 
     response = agent.invoke(
-        {"messages": [{"role": "user", "content": user_prompt}]},
+        {"messages": [{"role": "user", "content": _user_prompt(urls)}]},
         config=config,
     )
+    output = response["structured_response"]
 
-    result = response["structured_response"]
+    if urgent_only:
+        # Cheap path: only fire urgent alerts. Skip MD, PDF, daily digest.
+        # We still record the run so the KB stays warm for theme velocity.
+        run_id = record_run(output, urls, run_at=datetime.utcnow().isoformat(timespec="seconds"))
+        urgent = find_urgent(output, load_watchlist())
+        log.info("Urgent matches: %d", len(urgent))
+        for company, watch in urgent:
+            send_urgent_alert(company, watch)
+        return run_id
 
+    report_path = save_markdown_report(urls, output)
+    log.info("Markdown report saved: %s", report_path)
+
+    pdfs = generate_onepagers(output.companies)
+    if pdfs:
+        log.info("PDF one-pagers generated: %d", len(pdfs))
+
+    run_id = record_run(
+        output,
+        urls,
+        run_at=datetime.utcnow().isoformat(timespec="seconds"),
+        report_path=report_path,
+    )
+
+    # Tiered alerts — all three tiers fire in a full run.
+    watchlist = load_watchlist()
+    urgent = find_urgent(output, watchlist)
+    for company, watch in urgent:
+        send_urgent_alert(company, watch)
+    for spike in find_theme_spikes(output):
+        send_theme_spike(spike)
+    send_daily_digest(output, report_path)
+
+    _print_console_summary(output, report_path, urgent_count=len(urgent))
+    return run_id
+
+
+def _print_console_summary(output, report_path: str, urgent_count: int) -> None:
     print("\n=== VC SCOUT NOTE ===\n")
-    print("Sources analyzed:")
-    for u in urls:
-        print(f"  - {u}")
-    print("\nHeadline summary:")
-    print(result.headline_summary)
-    print("\nWhy it matters:")
-    print(result.why_it_matters)
-    print("\nPossible investment angle:")
-    print(result.possible_investment_angle)
-    print("\nRisks or limitations:")
-    print(result.risks_or_limitations)
-    print("\nList with scoring decisions:")
-    print(result.list_with_scoring_decisions)
+    print(f"Report: {report_path}")
+    print(f"Urgent watchlist hits: {urgent_count}")
+    print(f"\nHeadline summary:\n{output.headline_summary}")
+    print(f"\nVisible only when combined:\n{output.visible_only_when_combined}")
+    print(f"\nContrarian view:\n{output.contrarian_view}")
+    print(f"\nThemes: {', '.join(output.themes) if output.themes else '—'}")
+    if output.companies:
+        top = sorted(output.companies, key=lambda c: c.score_total, reverse=True)[:5]
+        print("\nTop scored:")
+        for c in top:
+            print(f"  - {c.name}: {c.score_total}/10  [{c.regulatory_tag}; {c.sovereignty_tag}]")
 
-    saved_file = save_markdown_report(urls, result)
-    print(f"\nMarkdown report saved to: {saved_file}")
-    return result
+
+def _cli_timeline(name: str) -> None:
+    rows = company_timeline(name)
+    if not rows:
+        print(f"No recorded mentions for {name!r}.")
+        return
+    print(f"\nTimeline for {name} ({len(rows)} mentions):\n")
+    for row in rows:
+        print(
+            f"  {row['run_at']}  ·  score {row['score_total']}  ·  "
+            f"reg={row['regulatory_tag']}  ·  sov={row['sovereignty_tag']}  ·  "
+            f"funding={row['funding_signal']}"
+        )
+
+
+def _cli_theme_velocity() -> None:
+    rows = theme_velocity()
+    if not rows:
+        print("No themes recorded yet — run the scout first.")
+        return
+    print("\nTheme velocity (recent vs prior 7-day window):\n")
+    for row in rows:
+        arrow = "↑" if row["recent_n"] > row["prior_n"] else ("=" if row["recent_n"] == row["prior_n"] else "↓")
+        print(f"  {arrow}  {row['theme']:<40}  recent={row['recent_n']:>3}   prior={row['prior_n']:>3}")
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="VC Scout — European-VC research agent")
+    p.add_argument("--urgent", action="store_true", help="Run the cheap intra-day pass: urgent alerts only.")
+    p.add_argument("--timeline", metavar="COMPANY", help="Print recorded timeline for a company across runs.")
+    p.add_argument("--theme-velocity", action="store_true", help="Print recent-vs-prior theme mention counts.")
+    p.add_argument("--sources", nargs="*", help="Override the default source URL list.")
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    if args.timeline:
+        _cli_timeline(args.timeline)
+        return
+    if args.theme_velocity:
+        _cli_theme_velocity()
+        return
+    urls = args.sources or DEFAULT_SOURCES
+    run(urls, urgent_only=args.urgent)
 
 
 if __name__ == "__main__":
-    run_agent(SOURCES)
+    main()

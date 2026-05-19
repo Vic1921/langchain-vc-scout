@@ -6,3 +6,12 @@ __pycache__/
 .idea/
 *.egg-info/
 dist/
+
+# Runtime artifacts — the knowledge base and any local watchlist must not
+# leak to the public repo. Examples and templates are committed; instances
+# stay local.
+data/
+*.db
+*.sqlite
+outputs/
+watchlist.csv
