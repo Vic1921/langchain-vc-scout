@@ -1,0 +1,91 @@
+name: VC Scout — daily digest
+
+on:
+  schedule:
+    # 06:00 UTC Mon-Fri = 07:00 / 08:00 CET (winter / summer). EU markets opening hour.
+    - cron: "0 6 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to commit the SQLite KB + reports back to the reports branch
+
+concurrency:
+  group: scout-daily
+  cancel-in-progress: false
+
+jobs:
+  scout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore knowledge base from previous runs
+        uses: actions/cache/restore@v4
+        with:
+          path: data/vc_scout.db
+          key: vc-scout-kb-${{ github.run_id }}
+          restore-keys: vc-scout-kb-
+
+      - name: Run scout
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python -m src.main
+
+      - name: Save knowledge base cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/vc_scout.db
+          key: vc-scout-kb-${{ github.run_id }}
+
+      - name: Publish reports to the `reports` branch
+        if: success()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "vc-scout-bot"
+          git config user.email "vc-scout-bot@users.noreply.github.com"
+          # Worktree the reports branch (create it as orphan if missing) so we
+          # don't pollute main with daily-run noise.
+          if ! git ls-remote --exit-code --heads origin reports >/dev/null 2>&1; then
+            git checkout --orphan reports
+            git rm -rf . >/dev/null 2>&1 || true
+            echo "# VC Scout reports" > README.md
+            git add README.md
+            git commit -m "init reports branch"
+            git push -u origin reports
+            git checkout -
+          fi
+          git fetch origin reports
+          git worktree add ../reports-wt origin/reports || git worktree add ../reports-wt reports
+          mkdir -p ../reports-wt/outputs ../reports-wt/data
+          cp -r outputs/* ../reports-wt/outputs/ 2>/dev/null || true
+          [ -f data/vc_scout.db ] && cp data/vc_scout.db ../reports-wt/data/vc_scout.db || true
+          cd ../reports-wt
+          git add -A
+          git diff --cached --quiet || git commit -m "scout: daily run $(date -u +%Y-%m-%d_%H:%M)"
+          git push origin HEAD:reports
+
+      - name: Upload reports as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vc-scout-reports-${{ github.run_id }}
+          path: |
+            outputs/
+            data/vc_scout.db
+          if-no-files-found: warn
+          retention-days: 30
