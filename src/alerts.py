@@ -14,6 +14,7 @@ useful for debugging the workflow without spamming the chat.
 from __future__ import annotations
 
 import csv
+import hashlib
 import logging
 import os
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from pathlib import Path
 import requests
 
 from .schema import ScoredCompany, VCScoutOutput
-from .storage import theme_velocity
+from .storage import ConvictionDelta, theme_velocity
 
 
 logger = logging.getLogger(__name__)
@@ -118,6 +119,22 @@ def find_theme_spikes(
     return spikes
 
 
+def urgent_dedup_key(company: ScoredCompany) -> str:
+    """Stable key for an urgent alert — same company + same funding signal = same alert.
+
+    Hashing the funding-signal text means a genuinely *new* round re-fires,
+    but the identical headline sitting on the page for three days does not.
+    """
+    signal = (company.funding_signal or "").strip().lower()
+    digest = hashlib.sha1(signal.encode("utf-8")).hexdigest()[:12]
+    return f"urgent:{company.name.lower()}:{digest}"
+
+
+def theme_spike_dedup_key(theme: str) -> str:
+    """Stable key for a theme-spike alert."""
+    return f"theme_spike:{theme.strip().lower()}"
+
+
 def _telegram_creds() -> tuple[str, str] | None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -146,10 +163,15 @@ def send_message(text: str, parse_mode: str = "Markdown") -> bool:
     return True
 
 
-def send_urgent_alert(company: ScoredCompany, watch: WatchlistEntry) -> bool:
+def send_urgent_alert(
+    company: ScoredCompany,
+    watch: WatchlistEntry,
+    delta: ConvictionDelta | None = None,
+) -> bool:
+    conviction = f"\n*Conviction:* {delta.render()}" if delta else ""
     text = (
         f"🚨 *URGENT — watchlist hit with funding signal*\n\n"
-        f"*{company.name}*  (score {company.score_total}/10)\n"
+        f"*{company.name}*  (score {company.score_total}/10){conviction}\n"
         f"Thesis tag: `{watch.thesis_tag or '—'}`\n"
         f"Note: {watch.note or '—'}\n\n"
         f"*Funding signal:* {company.funding_signal}\n"
@@ -169,13 +191,24 @@ def send_theme_spike(spike: dict) -> bool:
     return send_message(text)
 
 
-def send_daily_digest(output: VCScoutOutput, report_path: str | None) -> bool:
+def send_daily_digest(
+    output: VCScoutOutput,
+    report_path: str | None,
+    deltas: dict[str, ConvictionDelta] | None = None,
+    monthly: dict | None = None,
+) -> bool:
+    deltas = deltas or {}
     top = sorted(output.companies, key=lambda c: c.score_total, reverse=True)[:5]
-    top_block = "\n".join(
-        f"  {i+1}. *{c.name}* — {c.score_total}/10  "
-        f"[{c.regulatory_tag}; {c.sovereignty_tag}]"
-        for i, c in enumerate(top)
-    ) or "  (no scored companies today)"
+
+    def _line(i: int, c: ScoredCompany) -> str:
+        d = deltas.get(c.name.lower())
+        badge = f"  ({d.badge()})" if d else ""
+        return (
+            f"  {i + 1}. *{c.name}* — {c.score_total}/10{badge}  "
+            f"[{c.regulatory_tag}; {c.sovereignty_tag}]"
+        )
+
+    top_block = "\n".join(_line(i, c) for i, c in enumerate(top)) or "  (no scored companies today)"
     text = (
         f"☕ *VC Scout — daily digest*\n\n"
         f"*Headline:* {output.headline_summary[:280]}\n\n"
@@ -184,6 +217,12 @@ def send_daily_digest(output: VCScoutOutput, report_path: str | None) -> bool:
         f"*Top scored:*\n{top_block}\n\n"
         f"Themes: {', '.join(output.themes[:6]) if output.themes else '—'}\n"
     )
+    if monthly:
+        text += (
+            f"\n💸 Scout spend ({monthly['year_month']}): "
+            f"${monthly['cost']:.2f} · {monthly['runs']} run(s) · "
+            f"{monthly['input_tokens']:,} in / {monthly['output_tokens']:,} out tokens\n"
+        )
     if report_path:
         text += f"\nFull report: `{report_path}`"
     return send_message(text)

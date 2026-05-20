@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
@@ -20,6 +22,11 @@ from .schema import ScoredCompany, VCScoutOutput
 
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "vc_scout.db"
+
+
+def _utcnow() -> str:
+    """UTC timestamp in the same `YYYY-MM-DDTHH:MM:SS` format as runs.run_at."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 SCHEMA = """
@@ -66,6 +73,28 @@ CREATE TABLE IF NOT EXISTS themes (
 
 CREATE INDEX IF NOT EXISTS idx_themes_theme_lc ON themes(theme_lc);
 CREATE INDEX IF NOT EXISTS idx_themes_run ON themes(run_id);
+
+CREATE TABLE IF NOT EXISTS sent_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    alert_kind TEXT NOT NULL,
+    dedup_key TEXT NOT NULL UNIQUE,
+    sent_at TEXT NOT NULL,
+    detail TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_sent_alerts_key ON sent_alerts(dedup_key);
+
+CREATE TABLE IF NOT EXISTS run_costs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER REFERENCES runs(id),
+    model TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cost_usd REAL,
+    recorded_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_costs_recorded ON run_costs(recorded_at);
 """
 
 
@@ -240,3 +269,158 @@ def recent_high_scorers(
             (f"-{days} days", min_score),
         ).fetchall()
         return [dict(row) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Conviction delta — how a company's score moved vs the last time we saw it
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ConvictionDelta:
+    """A company's current score against its most recent prior KB record."""
+
+    name: str
+    current_score: float
+    is_new: bool
+    prev_score: float | None = None
+    prev_date: str | None = None
+
+    @property
+    def delta(self) -> float | None:
+        if self.is_new or self.prev_score is None:
+            return None
+        return round(self.current_score - self.prev_score, 1)
+
+    def badge(self) -> str:
+        """Compact marker for digest lines / console, e.g. '↑ +0.5' or 'NEW'."""
+        if self.is_new:
+            return "NEW"
+        d = self.delta or 0.0
+        if d > 0:
+            return f"↑ +{d}"
+        if d < 0:
+            return f"↓ {d}"
+        return "→ 0.0"
+
+    def render(self) -> str:
+        """Full sentence for alerts / reports."""
+        if self.is_new:
+            return "new to the knowledge base"
+        return (
+            f"{self.prev_score} → {self.current_score} "
+            f"({self.badge()}, last seen {self.prev_date})"
+        )
+
+
+def compute_conviction_deltas(
+    companies: Iterable[ScoredCompany],
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> dict[str, ConvictionDelta]:
+    """Map each company (lowercased name) to its score change vs the last KB record.
+
+    MUST be called BEFORE record_run for the current run — otherwise the
+    current run's freshly-inserted rows become the 'previous' record.
+    """
+    deltas: dict[str, ConvictionDelta] = {}
+    with _connect(db_path) as conn:
+        for company in companies:
+            row = conn.execute(
+                """
+                SELECT c.score_total, r.run_at
+                FROM companies c
+                JOIN runs r ON r.id = c.run_id
+                WHERE LOWER(c.name) = LOWER(?)
+                ORDER BY r.run_at DESC
+                LIMIT 1
+                """,
+                (company.name,),
+            ).fetchone()
+            if row is None:
+                deltas[company.name.lower()] = ConvictionDelta(
+                    name=company.name, current_score=company.score_total, is_new=True,
+                )
+            else:
+                deltas[company.name.lower()] = ConvictionDelta(
+                    name=company.name,
+                    current_score=company.score_total,
+                    is_new=False,
+                    prev_score=row["score_total"],
+                    prev_date=row["run_at"][:10],
+                )
+    return deltas
+
+
+# ---------------------------------------------------------------------------
+# Alert dedup ledger — stops the hourly urgent cron re-sending the same alert
+# ---------------------------------------------------------------------------
+def was_alert_sent(
+    dedup_key: str,
+    within_days: int = 14,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> bool:
+    """True if an alert with this key was sent within the cooldown window."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM sent_alerts WHERE dedup_key = ? AND sent_at >= datetime('now', ?) LIMIT 1",
+            (dedup_key, f"-{within_days} days"),
+        ).fetchone()
+        return row is not None
+
+
+def mark_alert_sent(
+    alert_kind: str,
+    dedup_key: str,
+    detail: str = "",
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> None:
+    """Record that an alert fired. INSERT OR REPLACE refreshes the cooldown."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO sent_alerts (alert_kind, dedup_key, sent_at, detail)
+            VALUES (?, ?, ?, ?)
+            """,
+            (alert_kind, dedup_key, _utcnow(), detail),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cost ledger — token spend per run, summarized per month
+# ---------------------------------------------------------------------------
+def record_cost(
+    run_id: int,
+    model: str,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: float,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> None:
+    """Persist the cost of one LLM call against a run."""
+    with _connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO run_costs (run_id, model, input_tokens, output_tokens, cost_usd, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (run_id, model, input_tokens, output_tokens, cost_usd, _utcnow()),
+        )
+
+
+def monthly_cost(
+    year_month: str | None = None,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> dict:
+    """Month-to-date spend. `year_month` defaults to the current UTC month."""
+    year_month = year_month or datetime.now(timezone.utc).strftime("%Y-%m")
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(cost_usd), 0)       AS cost,
+                   COALESCE(SUM(input_tokens), 0)   AS input_tokens,
+                   COALESCE(SUM(output_tokens), 0)  AS output_tokens,
+                   COUNT(DISTINCT run_id)           AS runs
+            FROM run_costs
+            WHERE recorded_at LIKE ?
+            """,
+            (f"{year_month}%",),
+        ).fetchone()
+        return {**dict(row), "year_month": year_month}

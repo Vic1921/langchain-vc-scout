@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from .schema import ScoredCompany, VCScoutOutput
+from .schema import QualityGrade, ScoredCompany, VCScoutOutput
 
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,8 @@ logger = logging.getLogger(__name__)
 def save_markdown_report(
     urls: list[str],
     output: VCScoutOutput,
+    deltas: dict | None = None,
+    grade: QualityGrade | None = None,
     outputs_dir: Path | None = None,
 ) -> str:
     """Render the full run to a timestamped Markdown file. Returns the path."""
@@ -32,7 +34,8 @@ def save_markdown_report(
 
     sources_block = "\n".join(f"- {u}" for u in urls)
     themes_block = ", ".join(output.themes) if output.themes else "—"
-    companies_block = _render_companies_md(output.companies)
+    companies_block = _render_companies_md(output.companies, deltas or {})
+    quality_block = _render_quality(grade)
 
     path.write_text(
         f"""# VC Scout Report
@@ -65,24 +68,39 @@ def save_markdown_report(
 
 ## Scored Companies / Startups
 {companies_block}
+
+## Quality Self-Check
+{quality_block}
 """,
         encoding="utf-8",
     )
     return str(path)
 
 
-def _render_companies_md(companies: list[ScoredCompany]) -> str:
+def _render_quality(grade: QualityGrade | None) -> str:
+    if grade is None:
+        return "_(not graded)_"
+    if not grade.issues:
+        return f"Auditor score: **{grade.score}/10** — no issues flagged."
+    issues = "\n".join(f"- {i}" for i in grade.issues)
+    return f"Auditor score: **{grade.score}/10**\n\nFlagged issues:\n{issues}"
+
+
+def _render_companies_md(companies: list[ScoredCompany], deltas: dict) -> str:
     if not companies:
         return "_(no companies surfaced in this run)_"
     sorted_companies = sorted(companies, key=lambda c: c.score_total, reverse=True)
     lines: list[str] = []
     for c in sorted_companies:
         sources_str = ", ".join(c.sources) if c.sources else "—"
+        delta = deltas.get(c.name.lower())
+        conviction_line = f"- **Conviction:** {delta.render()}\n" if delta else ""
         lines.append(
             f"### {c.name}  —  **{c.score_total}/10**\n"
             f"- **Scores:** market {c.score_market} · team {c.score_team} · "
             f"product {c.score_product} · defensibility {c.score_defensibility} · "
             f"interest {c.score_interest}\n"
+            f"{conviction_line}"
             f"- **Regulatory:** {c.regulatory_tag}\n"
             f"- **Sovereignty thesis:** {c.sovereignty_tag}\n"
             f"- **Vintage match:** {c.vintage_match}\n"
