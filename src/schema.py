@@ -86,3 +86,19 @@ class VCScoutOutput(BaseModel):
     risks_or_limitations: str = Field(description="Risks, data gaps, source bias")
     themes: list[str] = Field(default_factory=list, description="3-6 recurring themes across the sources, short noun phrases")
     companies: list[ScoredCompany] = Field(default_factory=list)
+
+
+class QualityGrade(BaseModel):
+    """Verdict from the self-grading pass (see grading.py)."""
+
+    score: int = Field(
+        ge=0, le=10,
+        description="0 = generic hype with no signal; 10 = sharp, specific, source-cited",
+    )
+    issues: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Specific, actionable weaknesses: named hype phrases, vague unsupported "
+            "claims, or company rationales missing [source: <url>] citations"
+        ),
+    )

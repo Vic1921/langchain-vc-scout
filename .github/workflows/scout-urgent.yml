@@ -43,3 +43,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python -m src.main --urgent
+
+      # The KB must be saved back, not just restored — the sent_alerts dedup
+      # ledger written this run is what stops the next hourly run re-sending
+      # the same urgent alert.
+      - name: Save knowledge base cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/vc_scout.db
+          key: vc-scout-kb-${{ github.run_id }}

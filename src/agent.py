@@ -36,6 +36,9 @@ You will be given MULTIPLE sources to analyze in a single pass. You MUST:
    - `vintage_match`: closest historical analogue as a named pattern (e.g. 'Mistral-pattern: open-source AI + EU sovereignty').
    - `funding_signal`: if a funding round is mentioned, quote it verbatim; otherwise 'none'.
 
+If a source returns "(scrape failed: ...)", do not abort — note the missing source
+in `risks_or_limitations` and synthesize from the sources that succeeded.
+
 Be practical, specific, and avoid hype and corporate fluff. Concrete, actionable analysis only.
 If the combined sources look noisy or PR-driven, say so plainly in `risks_or_limitations`.
 Bias your output toward European angles: when comparing a US round to a European analogue, name the analogue.
@@ -48,10 +51,15 @@ def scrape_headlines(url: str) -> str:
 
     Input should be a full URL. Returns headlines prefixed with a source
     marker so the model can attribute claims back to the originating URL.
+    On any network/HTTP failure it returns a `(scrape failed: ...)` marker
+    instead of raising, so one dead source can't abort the whole run.
     """
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = requests.get(url, headers=headers, timeout=20)
-    response.raise_for_status()
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; VCScoutBot/1.0)"}
+    try:
+        response = requests.get(url, headers=headers, timeout=20)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return f"=== SOURCE: {url} ===\n(scrape failed: {type(exc).__name__}: {exc})"
 
     soup = BeautifulSoup(response.text, "lxml")
     texts: list[str] = []

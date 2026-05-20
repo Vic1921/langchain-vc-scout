@@ -17,11 +17,15 @@ Each run produces:
 - **Risks and limitations** to keep the analysis grounded
 - A **scored list** of companies with **EU regulatory tags** (AI Act / DORA / MiCA / NIS2 / GDPR), **EU sovereignty thesis** fit (defense, semis, sovereign-cloud, biotech, energy), a **vintage match** to a historical analogue, and a **funding signal** quoted verbatim when present
 
+Every report is then graded by a second, cheaper model (Haiku) on concreteness and signal — if it scores below the bar, the main agent regenerates it once with the auditor's specific complaints fed back in.
+
 Outputs:
 - Timestamped Markdown report in `outputs/`
 - One-page PDF for every company scoring ≥ 7.5/10 (in `outputs/onepagers/`)
-- SQLite knowledge base in `data/vc_scout.db` — company timelines and theme velocity accumulate across runs
-- Tiered Telegram alerts: daily digest, theme-spike, and an **urgent** ping when a watchlist company appears with a funding signal
+- SQLite knowledge base in `data/vc_scout.db` — company timelines, theme velocity, alert ledger, and cost ledger accumulate across runs
+- **Conviction delta** on every company — how today's score moved vs the last time the KB saw it (e.g. `8.6 → 9.1 ↑ +0.5`)
+- Tiered Telegram alerts: daily digest, theme-spike, and an **urgent** ping when a watchlist company appears with a funding signal. Urgent alerts are deduplicated, so the hourly cron never re-sends the same signal
+- A **cost ledger** — token spend per run, summarized as month-to-date spend in the daily digest
 
 ---
 
@@ -57,12 +61,13 @@ The agent uses **LangGraph's `InMemorySaver`** as a checkpointer (per-run isolat
 |---|---|
 | Agent framework | [LangChain](https://python.langchain.com/) |
 | Per-run memory | [LangGraph](https://langchain-ai.github.io/langgraph/) `InMemorySaver` |
-| Cross-run memory (KB) | SQLite (`data/vc_scout.db`) — companies, themes, full run history |
-| LLM | Claude Sonnet 4.6 via Anthropic API |
-| Web scraping | `requests` + `BeautifulSoup` (`lxml`) |
+| Cross-run memory (KB) | SQLite (`data/vc_scout.db`) — companies, themes, run history, alert + cost ledgers |
+| Main LLM | Claude Sonnet 4.6 via Anthropic API |
+| Quality auditor | Claude Haiku 4.5 — grades each report, triggers one regeneration if it fails the bar |
+| Web scraping | `requests` + `BeautifulSoup` (`lxml`) — per-source failures are non-fatal |
 | Structured output | `pydantic` v2 + `ToolStrategy` (nested `ScoredCompany` list) |
 | PDF one-pagers | `reportlab` (A4, score table, sources, rationale) |
-| Alerts | Telegram Bot API (graceful no-op if creds absent) |
+| Alerts | Telegram Bot API (deduplicated; graceful no-op if creds absent) |
 | Scheduling | GitHub Actions cron (daily digest + hourly urgent) |
 | Config | `python-dotenv` + optional `watchlist.csv` |
 
@@ -73,13 +78,17 @@ The agent uses **LangGraph's `InMemorySaver`** as a checkpointer (per-run isolat
 ```
 langchain-vc-scout/
 ├── src/
-│   ├── main.py          # CLI entry point (full run, --urgent, --timeline, --theme-velocity)
-│   ├── agent.py         # Scraper tool + system prompt + model + agent wiring
-│   ├── schema.py        # Pydantic models (VCScoutOutput, ScoredCompany)
+│   ├── main.py          # CLI entry point (full run, --urgent, --timeline, --theme-velocity, --cost)
+│   ├── agent.py         # Scraper tool (resilient) + system prompt + model + agent wiring
+│   ├── schema.py        # Pydantic models (VCScoutOutput, ScoredCompany, QualityGrade)
 │   ├── sources.py       # Default source URL list (US + EU mix)
-│   ├── storage.py       # SQLite KB — record_run, company_timeline, theme_velocity
-│   ├── alerts.py        # Watchlist + Telegram tiered alerts
-│   └── reports.py       # Markdown + reportlab PDF one-pager
+│   ├── storage.py       # SQLite KB — runs, companies, themes, conviction, alert + cost ledgers
+│   ├── alerts.py        # Watchlist + Telegram tiered alerts + dedup keys
+│   ├── reports.py       # Markdown + reportlab PDF one-pager
+│   ├── costs.py         # Token-usage pricing + the cost ledger
+│   └── grading.py       # Haiku self-grading pass + regeneration prompt
+├── scripts/
+│   └── smoke_storage.py # LLM-free end-to-end test of storage / alert / cost layers
 ├── .github/workflows/
 │   ├── scout-daily.yml  # Mon–Fri 06:00 UTC — full run + digest, KB cached
 │   └── scout-urgent.yml # Mon–Fri hourly — urgent-only intra-day pass
@@ -142,6 +151,9 @@ python -m src.main --timeline "Mistral AI"
 
 # Print theme velocity: recent-vs-prior 7-day mention counts
 python -m src.main --theme-velocity
+
+# Print the month-to-date cost ledger
+python -m src.main --cost
 
 # Override the source list ad hoc
 python -m src.main --sources https://sifted.eu https://techcrunch.com/category/artificial-intelligence/
