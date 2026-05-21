@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import logging
 import os
 from dataclasses import dataclass
@@ -51,21 +52,40 @@ class WatchlistEntry:
 
 
 def load_watchlist(path: Path | str = DEFAULT_WATCHLIST_PATH) -> list[WatchlistEntry]:
-    """Load a CSV with columns: name, thesis_tag, note. Missing file = empty list."""
+    """Load the watchlist, in priority order:
+
+    1. the WATCHLIST_CSV env var holding raw CSV text — for CI / containers /
+       workers where shipping a file alongside the code is awkward,
+    2. the CSV file at `path` — for local or persistent-disk deployments.
+
+    Missing both → empty list (urgent alerts simply never fire). Never raises,
+    so an absent or malformed watchlist degrades gracefully.
+    """
+    raw = os.environ.get("WATCHLIST_CSV", "").strip()
+    if raw:
+        return _parse_watchlist(io.StringIO(raw))
     path = Path(path)
-    if not path.exists():
-        return []
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        return [
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as f:
+            return _parse_watchlist(f)
+    return []
+
+
+def _parse_watchlist(handle) -> list[WatchlistEntry]:
+    """Parse watchlist rows from any text handle. Columns: name, thesis_tag, note."""
+    entries: list[WatchlistEntry] = []
+    for row in csv.DictReader(handle):
+        name = (row.get("name") or "").strip()
+        if not name:
+            continue
+        entries.append(
             WatchlistEntry(
-                name=row["name"].strip(),
-                thesis_tag=row.get("thesis_tag", "").strip(),
-                note=row.get("note", "").strip(),
+                name=name,
+                thesis_tag=(row.get("thesis_tag") or "").strip(),
+                note=(row.get("note") or "").strip(),
             )
-            for row in reader
-            if row.get("name", "").strip()
-        ]
+        )
+    return entries
 
 
 def has_funding_signal(company: ScoredCompany) -> bool:

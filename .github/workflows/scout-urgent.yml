@@ -42,6 +42,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCHLIST_CSV: ${{ secrets.WATCHLIST_CSV }}
         run: python -m src.main --urgent
 
       # The KB must be saved back, not just restored — the sent_alerts dedup

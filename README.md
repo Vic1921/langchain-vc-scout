@@ -163,19 +163,38 @@ Reports land in `outputs/vc_scout_report_<timestamp>.md`. PDF one-pagers for top
 
 ### 6. (Optional) Enable Telegram alerts
 
-1. Talk to [@BotFather](https://t.me/BotFather), create a bot, copy the token.
-2. Send any message to your bot, then call `https://api.telegram.org/bot<TOKEN>/getUpdates` to find your `chat.id`.
-3. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env`.
+Creating the bot is the one step that can't be automated — Telegram only allows it via @BotFather. Everything after that is scripted:
 
-Without these env vars the alert layer is a logged no-op — fine for local development.
+1. Open Telegram, message [@BotFather](https://t.me/BotFather), send `/newbot`, follow the prompts, copy the **bot token**.
+2. Open a chat with your new bot and send it any message (e.g. `hi`) — the bot can only learn your chat id from a message you sent it.
+3. Run the helper — it finds your chat id, sends a test message, and writes both values to `.env`:
+   ```bash
+   python scripts/telegram_setup.py <BOT_TOKEN> --write-env
+   ```
+
+Without `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` the alert layer is a logged no-op — fine for local development.
 
 ### 7. (Optional) Build a watchlist
 
-Copy `watchlist.example.csv` to `watchlist.csv` and replace the entries with companies your fund is actively tracking. When any of them surfaces in the scout's output with a non-empty `funding_signal`, you get an immediate Telegram ping (no waiting for the daily digest).
+Copy `watchlist.example.csv` to `watchlist.csv` and replace the entries with companies your fund is actively tracking. When any of them surfaces with a non-empty `funding_signal`, you get an immediate (deduplicated) Telegram ping — no waiting for the daily digest.
+
+The watchlist resolves from the `WATCHLIST_CSV` environment variable first (raw CSV text), then the `watchlist.csv` file — so a stateless CI runner or container can be fed the watchlist without a committed file. See **Deploying** below.
 
 ### 8. (Optional) Run it 24/7 on GitHub Actions
 
-Push the repo to GitHub and add three secrets: `ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`. The included workflows take over:
+Push the repo to GitHub and add the repo secrets below (Settings → Secrets and variables → Actions), then the included workflows take over:
+
+| Secret | Required? | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | **yes** | LLM calls — without it every run fails |
+| `TELEGRAM_BOT_TOKEN` | optional | alert delivery (no-op if absent) |
+| `TELEGRAM_CHAT_ID` | optional | alert delivery (no-op if absent) |
+| `WATCHLIST_CSV` | optional | raw CSV — required for urgent alerts to fire on CI, since `watchlist.csv` is git-ignored and never reaches the runner |
+
+```bash
+gh secret set ANTHROPIC_API_KEY  --repo <owner>/<repo> --body "<key>"
+gh secret set WATCHLIST_CSV      --repo <owner>/<repo> < watchlist.csv
+```
 
 - `scout-daily.yml` — Mon–Fri 06:00 UTC, full pipeline, publishes reports + the SQLite KB to a `reports` branch.
 - `scout-urgent.yml` — Mon–Fri hourly during European business hours, urgent-only.
@@ -185,10 +204,29 @@ Push the repo to GitHub and add three secrets: `ANTHROPIC_API_KEY`, `TELEGRAM_BO
 ## Configuration
 
 - **Sources** — edit `DEFAULT_SOURCES` in [src/sources.py](src/sources.py), or pass `--sources URL [URL …]` on the CLI.
-- **Watchlist** — `watchlist.csv` at the repo root. Columns: `name,thesis_tag,note`. Template at [watchlist.example.csv](watchlist.example.csv).
+- **Watchlist** — `watchlist.csv` at the repo root, or the `WATCHLIST_CSV` env var (raw CSV text, takes precedence). Columns: `name,thesis_tag,note`. Template at [watchlist.example.csv](watchlist.example.csv).
 - **Model behavior** — `build_agent()` in [src/agent.py](src/agent.py): `temperature=0.3` (analytical), `max_tokens=4000` (room for nested scoring), `timeout=90`.
 - **System prompt** — `SYSTEM_PROMPT` in [src/agent.py](src/agent.py). Tuned for European-VC framing; edit if you want a different persona.
 - **Alert thresholds** — `find_theme_spikes(spike_ratio=2.0, min_recent=3)` and `generate_onepagers(min_score=7.5)` are the two knobs worth tuning by fund stage.
+
+---
+
+## Deploying
+
+Every input is configurable by environment variable, so the scout runs the same way on a laptop, a server, a container, or CI.
+
+**GitHub Actions** (included, zero infra) — add the secrets from step 8 above; the two workflows cron it. The SQLite KB persists via `actions/cache` between runs and is mirrored to a `reports` branch.
+
+**A server / worker** — clone the repo, `pip install -r requirements.txt`, then schedule two commands with cron, systemd timers, or any scheduler:
+
+```bash
+python -m src.main            # daily  — full run + digest
+python -m src.main --urgent   # hourly — deduped urgent alerts only
+```
+
+Supply config via a `.env` file + `watchlist.csv` on disk, or purely via environment variables (`ANTHROPIC_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `WATCHLIST_CSV`). The KB at `data/vc_scout.db` persists naturally on disk — no cache or branch mirroring needed.
+
+Each invocation is independent, so a transient failure (a blocked source, an API hiccup) costs at most one tick — the next scheduled run self-heals.
 
 ---
 
