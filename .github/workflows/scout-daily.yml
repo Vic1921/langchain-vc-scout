@@ -41,6 +41,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          WATCHLIST_CSV: ${{ secrets.WATCHLIST_CSV }}
         run: python -m src.main
 
       - name: Save knowledge base cache
@@ -50,34 +51,41 @@ jobs:
           path: data/vc_scout.db
           key: vc-scout-kb-${{ github.run_id }}
 
-      - name: Publish reports to the `reports` branch
+      - name: Publish reports to the reports branch
         if: success()
+        continue-on-error: true   # report history is nice-to-have — never fail the run over it
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          git config user.name "vc-scout-bot"
-          git config user.email "vc-scout-bot@users.noreply.github.com"
-          # Worktree the reports branch (create it as orphan if missing) so we
-          # don't pollute main with daily-run noise.
-          if ! git ls-remote --exit-code --heads origin reports >/dev/null 2>&1; then
-            git checkout --orphan reports
-            git rm -rf . >/dev/null 2>&1 || true
-            echo "# VC Scout reports" > README.md
-            git add README.md
-            git commit -m "init reports branch"
-            git push -u origin reports
-            git checkout -
+          set -euo pipefail
+          if [ ! -d outputs ] && [ ! -f data/vc_scout.db ]; then
+            echo "nothing generated this run — skipping publish"
+            exit 0
           fi
-          git fetch origin reports
-          git worktree add ../reports-wt origin/reports || git worktree add ../reports-wt reports
-          mkdir -p ../reports-wt/outputs ../reports-wt/data
-          cp -r outputs/* ../reports-wt/outputs/ 2>/dev/null || true
-          [ -f data/vc_scout.db ] && cp data/vc_scout.db ../reports-wt/data/vc_scout.db || true
-          cd ../reports-wt
-          git add -A
-          git diff --cached --quiet || git commit -m "scout: daily run $(date -u +%Y-%m-%d_%H:%M)"
-          git push origin HEAD:reports
+          # Work in an isolated clone so we never branch-switch the main working
+          # tree — that is where the earlier 'git checkout -' crash lived.
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          PUB="$(mktemp -d)"
+          if git ls-remote --exit-code --heads "$REPO_URL" reports >/dev/null 2>&1; then
+            git clone --depth 1 --branch reports "$REPO_URL" "$PUB"
+          else
+            git init -q "$PUB"
+            git -C "$PUB" checkout -q -b reports
+          fi
+          git -C "$PUB" config user.name "vc-scout-bot"
+          git -C "$PUB" config user.email "vc-scout-bot@users.noreply.github.com"
+          [ -d outputs ] && cp -r outputs "$PUB/outputs" || true
+          if [ -f data/vc_scout.db ]; then
+            mkdir -p "$PUB/data"
+            cp data/vc_scout.db "$PUB/data/vc_scout.db"
+          fi
+          git -C "$PUB" add -A
+          if git -C "$PUB" diff --cached --quiet; then
+            echo "no report changes to publish"
+            exit 0
+          fi
+          git -C "$PUB" commit -m "scout: run $(date -u +%Y-%m-%dT%H:%MZ)"
+          git -C "$PUB" push "$REPO_URL" HEAD:reports
 
       - name: Upload reports as workflow artifact
         if: always()

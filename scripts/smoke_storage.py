@@ -7,6 +7,7 @@ Run from the repo root: python scripts/smoke_storage.py
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from src.alerts import (
     WatchlistEntry,
     find_urgent,
     has_funding_signal,
+    load_watchlist,
     theme_spike_dedup_key,
     urgent_dedup_key,
 )
@@ -161,6 +163,16 @@ def main() -> int:
         assert has_funding_signal(_make_output().companies[0]), "Helsing should have a funding signal"
         assert not has_funding_signal(_make_output(funding="none").companies[0]), "should be silent on 'none'"
         print(f"OK  find_urgent + has_funding_signal: {len(urgent)} hit, predicates correct")
+
+        # --- Watchlist from the WATCHLIST_CSV env var (CI / container path) ---
+        os.environ["WATCHLIST_CSV"] = "name,thesis_tag,note\nHelsing,defense-dual-use,from env\n"
+        try:
+            wl_env = load_watchlist()
+            assert len(wl_env) == 1 and wl_env[0].name == "Helsing", f"env watchlist parse failed: {wl_env}"
+        finally:
+            del os.environ["WATCHLIST_CSV"]
+        assert load_watchlist(path=db.parent / "nonexistent.csv") == [], "absent watchlist should be empty"
+        print("OK  load_watchlist: WATCHLIST_CSV env path + graceful absence")
 
         print("\nAll smoke checks passed.")
         return 0
