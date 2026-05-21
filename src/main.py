@@ -1,15 +1,19 @@
 """VC Scout entry point.
 
 Modes:
-- (default)        : full run — scrape, synthesize, self-grade (regenerate once
-                     if below the quality bar), save MD + PDF, persist to SQLite,
-                     record cost, emit daily digest + theme spikes, fire deduped
-                     urgent alerts.
-- --urgent         : cheap intra-day pass — scrape + synthesize, record the run +
-                     cost, fire only deduped URGENT alerts. No grading / MD / PDF.
-- --timeline NAME  : print a company's mention timeline across runs.
-- --theme-velocity : print themes ranked by recent-vs-prior mention count.
-- --cost           : print the month-to-date cost ledger.
+- (default)           : full run — scrape, synthesize, self-grade (regenerate once
+                        if below the quality bar), save MD + PDF, persist to SQLite,
+                        record cost, emit daily digest + theme spikes, fire deduped
+                        urgent alerts.
+- --urgent            : cheap intra-day pass — scrape + synthesize, record the run +
+                        cost, fire only deduped URGENT alerts. No grading / MD / PDF.
+- --weekly            : build the LP-grade weekly rollup from the knowledge base.
+- --triage TEXT|FILE  : triage an inbound company against the scout's rubric.
+- --timeline NAME     : print a company's mention timeline across runs.
+- --theme-velocity    : print themes ranked by recent-vs-prior mention count.
+- --hit-rate          : print the conviction hit-rate scorecard.
+- --suggest-watchlist : print companies the KB recommends adding to the watchlist.
+- --cost              : print the month-to-date cost ledger.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import argparse
 import logging
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -39,18 +44,23 @@ from .alerts import (
 )
 from .costs import CostRecord, extract_cost
 from .grading import QUALITY_BAR, grade_report, regeneration_prompt
+from .matching import normalize_name
 from .reports import generate_onepagers, save_markdown_report
+from .rollup import run_weekly_rollup
 from .sources import DEFAULT_SOURCES
 from .storage import (
     company_timeline,
     compute_conviction_deltas,
+    hit_rate,
     mark_alert_sent,
     monthly_cost,
     record_cost,
     record_run,
+    suggest_watchlist,
     theme_velocity,
     was_alert_sent,
 )
+from .triage import render_triage, triage_company
 
 
 load_dotenv()
@@ -159,18 +169,23 @@ def run(urls: list[str], urgent_only: bool = False) -> int:
             mark_alert_sent("theme_spike", key, spike["theme"])
 
     monthly = monthly_cost()
-    send_daily_digest(output, report_path, deltas=deltas, monthly=monthly)
+    watchlist = load_watchlist()
+    known = {normalize_name(lbl) for entry in watchlist for lbl in (entry.name, *entry.aliases)}
+    suggestions = suggest_watchlist(known)
+    send_daily_digest(output, report_path, deltas=deltas, monthly=monthly, suggestions=suggestions)
 
-    _print_console_summary(output, report_path, deltas, grade, monthly, fired)
+    _print_console_summary(output, report_path, deltas, grade, monthly, fired, suggestions)
     return run_id
 
 
-def _print_console_summary(output, report_path, deltas, grade, monthly, urgent_fired) -> None:
+def _print_console_summary(output, report_path, deltas, grade, monthly, urgent_fired, suggestions=None) -> None:
     print("\n=== VC SCOUT NOTE ===\n")
     print(f"Report: {report_path}")
     issues = f"  ({len(grade.issues)} issue(s) flagged)" if grade.issues else ""
     print(f"Quality self-check: {grade.score}/10{issues}")
     print(f"Urgent alerts fired: {urgent_fired}")
+    if suggestions:
+        print(f"Watchlist suggestions: {len(suggestions)} (run --suggest-watchlist)")
     print(f"Spend ({monthly['year_month']}): ${monthly['cost']:.2f} across {monthly['runs']} run(s)")
     print(f"\nHeadline summary:\n{output.headline_summary}")
     print(f"\nVisible only when combined:\n{output.visible_only_when_combined}")
@@ -219,12 +234,54 @@ def _cli_cost() -> None:
     print(f"  Spend:         ${m['cost']:.2f}")
 
 
+def _cli_hit_rate() -> None:
+    hr = hit_rate()
+    print(
+        f"\nHit-rate scorecard — companies first scored >= {hr['min_score']}, "
+        f"settled >= {hr['settle_days']}d:\n"
+    )
+    print(f"  Evaluated: {hr['evaluated']}")
+    print(f"  Hits:      {hr['hits']}  ({', '.join(hr['hit_names']) if hr['hit_names'] else '—'})")
+    print(f"  Hit rate:  {hr['rate'] * 100:.0f}%")
+
+
+def _cli_suggest_watchlist() -> None:
+    watchlist = load_watchlist()
+    known = {normalize_name(lbl) for entry in watchlist for lbl in (entry.name, *entry.aliases)}
+    rows = suggest_watchlist(known)
+    if not rows:
+        print("No new suggestions — the watchlist looks current.")
+        return
+    print(f"\nWatchlist suggestions ({len(rows)} recurring off-watchlist companies):\n")
+    for r in rows:
+        print(f"  {r['name']:<28}  avg {r['avg_score']}  ·  {r['appearances']} runs  ·  {r['sovereignty_tag']}")
+
+
+def _cli_triage(text_or_path: str) -> None:
+    candidate = Path(text_or_path)
+    text = candidate.read_text(encoding="utf-8") if candidate.is_file() else text_or_path
+    verdict, cost = triage_company(text)
+    record_cost(None, cost.model, cost.input_tokens, cost.output_tokens, cost.cost_usd)
+    note = render_triage(verdict)
+    outputs_dir = Path(__file__).resolve().parent.parent / "outputs"
+    outputs_dir.mkdir(exist_ok=True)
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in verdict.company)[:50]
+    path = outputs_dir / f"triage_{safe}_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.md"
+    path.write_text(note, encoding="utf-8")
+    print(note)
+    print(f"\n(triage note saved to {path})")
+
+
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="VC Scout — European-VC research agent")
     p.add_argument("--urgent", action="store_true", help="Cheap intra-day pass: deduped urgent alerts only.")
     p.add_argument("--timeline", metavar="COMPANY", help="Print a company's timeline across runs.")
     p.add_argument("--theme-velocity", action="store_true", help="Print recent-vs-prior theme mention counts.")
     p.add_argument("--cost", action="store_true", help="Print the month-to-date cost ledger.")
+    p.add_argument("--weekly", action="store_true", help="Build the LP-grade weekly rollup from the KB.")
+    p.add_argument("--hit-rate", action="store_true", help="Print the conviction hit-rate scorecard.")
+    p.add_argument("--suggest-watchlist", action="store_true", help="Print KB-recommended watchlist additions.")
+    p.add_argument("--triage", metavar="TEXT_OR_FILE", help="Triage an inbound company (inline text or a file path).")
     p.add_argument("--sources", nargs="*", help="Override the default source URL list.")
     return p.parse_args()
 
@@ -239,6 +296,18 @@ def main() -> None:
         return
     if args.cost:
         _cli_cost()
+        return
+    if args.hit_rate:
+        _cli_hit_rate()
+        return
+    if args.suggest_watchlist:
+        _cli_suggest_watchlist()
+        return
+    if args.triage:
+        _cli_triage(args.triage)
+        return
+    if args.weekly:
+        run_weekly_rollup()
         return
     urls = args.sources or DEFAULT_SOURCES
     run(urls, urgent_only=args.urgent)

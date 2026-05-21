@@ -14,10 +14,11 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator
 
+from .matching import normalize_name
 from .schema import ScoredCompany, VCScoutOutput
 
 
@@ -274,15 +275,33 @@ def recent_high_scorers(
 # ---------------------------------------------------------------------------
 # Conviction delta — how a company's score moved vs the last time we saw it
 # ---------------------------------------------------------------------------
+def _classify_trend(scores: list[float]) -> str:
+    """Label a score trajectory given oldest -> newest scores."""
+    if len(scores) < 2:
+        return "n/a"
+    diffs = [b - a for a, b in zip(scores, scores[1:])]
+    ups = sum(1 for d in diffs if d > 0)
+    downs = sum(1 for d in diffs if d < 0)
+    net = round(scores[-1] - scores[0], 1)
+    if net >= 0.5 and ups >= downs:
+        return "rising"
+    if net <= -0.5 and downs >= ups:
+        return "cooling"
+    if ups and downs:
+        return "volatile"
+    return "flat"
+
+
 @dataclass(frozen=True)
 class ConvictionDelta:
-    """A company's current score against its most recent prior KB record."""
+    """A company's current score against its KB history."""
 
     name: str
     current_score: float
     is_new: bool
     prev_score: float | None = None
     prev_date: str | None = None
+    trend: str = "n/a"
 
     @property
     def delta(self) -> float | None:
@@ -305,47 +324,53 @@ class ConvictionDelta:
         """Full sentence for alerts / reports."""
         if self.is_new:
             return "new to the knowledge base"
+        trend = f", {self.trend}" if self.trend not in ("n/a", "flat") else ""
         return (
             f"{self.prev_score} → {self.current_score} "
-            f"({self.badge()}, last seen {self.prev_date})"
+            f"({self.badge()}{trend}, last seen {self.prev_date})"
         )
 
 
 def compute_conviction_deltas(
     companies: Iterable[ScoredCompany],
+    history_window: int = 4,
     db_path: Path | str = DEFAULT_DB_PATH,
 ) -> dict[str, ConvictionDelta]:
-    """Map each company (lowercased name) to its score change vs the last KB record.
+    """Map each company (lowercased name) to its score change + trend vs the KB.
 
     MUST be called BEFORE record_run for the current run — otherwise the
-    current run's freshly-inserted rows become the 'previous' record.
+    current run's freshly-inserted rows become the 'previous' record. The
+    trend reads the last `history_window` scores plus the current one, so a
+    multi-run slide ("cooling") is visible, not just a single-step delta.
     """
     deltas: dict[str, ConvictionDelta] = {}
     with _connect(db_path) as conn:
         for company in companies:
-            row = conn.execute(
+            rows = conn.execute(
                 """
                 SELECT c.score_total, r.run_at
                 FROM companies c
                 JOIN runs r ON r.id = c.run_id
                 WHERE LOWER(c.name) = LOWER(?)
                 ORDER BY r.run_at DESC
-                LIMIT 1
+                LIMIT ?
                 """,
-                (company.name,),
-            ).fetchone()
-            if row is None:
+                (company.name, history_window),
+            ).fetchall()
+            if not rows:
                 deltas[company.name.lower()] = ConvictionDelta(
                     name=company.name, current_score=company.score_total, is_new=True,
                 )
-            else:
-                deltas[company.name.lower()] = ConvictionDelta(
-                    name=company.name,
-                    current_score=company.score_total,
-                    is_new=False,
-                    prev_score=row["score_total"],
-                    prev_date=row["run_at"][:10],
-                )
+                continue
+            prior_scores = [r["score_total"] for r in reversed(rows)]  # oldest -> newest
+            deltas[company.name.lower()] = ConvictionDelta(
+                name=company.name,
+                current_score=company.score_total,
+                is_new=False,
+                prev_score=rows[0]["score_total"],
+                prev_date=rows[0]["run_at"][:10],
+                trend=_classify_trend(prior_scores + [company.score_total]),
+            )
     return deltas
 
 
@@ -424,3 +449,151 @@ def monthly_cost(
             (f"{year_month}%",),
         ).fetchone()
         return {**dict(row), "year_month": year_month}
+
+
+# ---------------------------------------------------------------------------
+# Watchlist auto-suggest — companies the KB keeps surfacing that you don't track
+# ---------------------------------------------------------------------------
+def suggest_watchlist(
+    known_normalized: set[str],
+    min_appearances: int = 3,
+    min_avg_score: float = 7.5,
+    days: int = 30,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> list[dict]:
+    """Recurring, high-scoring companies that are NOT already on the watchlist.
+
+    `known_normalized` is the set of normalize_name() forms of every watchlist
+    name + alias — the caller builds it, so storage stays watchlist-agnostic.
+    """
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT c.name AS name,
+                   COUNT(*) AS appearances,
+                   ROUND(AVG(c.score_total), 1) AS avg_score,
+                   MAX(c.score_total) AS best_score,
+                   MAX(c.sovereignty_tag) AS sovereignty_tag,
+                   MAX(c.regulatory_tag) AS regulatory_tag
+            FROM companies c
+            JOIN runs r ON r.id = c.run_id
+            WHERE r.run_at >= datetime('now', ?)
+            GROUP BY LOWER(c.name)
+            HAVING appearances >= ? AND avg_score >= ?
+            ORDER BY avg_score DESC, appearances DESC
+            """,
+            (f"-{days} days", min_appearances, min_avg_score),
+        ).fetchall()
+    return [dict(r) for r in rows if normalize_name(r["name"]) not in known_normalized]
+
+
+# ---------------------------------------------------------------------------
+# Hit-rate scorecard — did the scout's high-conviction calls play out?
+# ---------------------------------------------------------------------------
+def hit_rate(
+    min_score: float = 8.0,
+    settle_days: int = 90,
+    db_path: Path | str = DEFAULT_DB_PATH,
+) -> dict:
+    """Of companies first scored >= min_score long enough ago to judge, the
+    fraction that later showed a funding signal in a subsequent run."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=settle_days)).strftime("%Y-%m-%dT%H:%M:%S")
+    with _connect(db_path) as conn:
+        highs = conn.execute(
+            """
+            SELECT LOWER(c.name) AS name_lc, c.name AS name, MIN(r.run_at) AS first_high
+            FROM companies c JOIN runs r ON r.id = c.run_id
+            WHERE c.score_total >= ?
+            GROUP BY LOWER(c.name)
+            """,
+            (min_score,),
+        ).fetchall()
+        fundings = conn.execute(
+            """
+            SELECT LOWER(c.name) AS name_lc, r.run_at AS run_at
+            FROM companies c JOIN runs r ON r.id = c.run_id
+            WHERE c.funding_signal IS NOT NULL
+              AND LOWER(TRIM(c.funding_signal)) NOT IN ('none', '')
+            """
+        ).fetchall()
+    funding_dates: dict[str, list[str]] = {}
+    for f in fundings:
+        funding_dates.setdefault(f["name_lc"], []).append(f["run_at"])
+    evaluated = 0
+    hits: list[str] = []
+    for h in highs:
+        if h["first_high"] > cutoff:
+            continue  # too recent to fairly judge
+        evaluated += 1
+        if any(d >= h["first_high"] for d in funding_dates.get(h["name_lc"], [])):
+            hits.append(h["name"])
+    return {
+        "evaluated": evaluated,
+        "hits": len(hits),
+        "rate": round(len(hits) / evaluated, 3) if evaluated else 0.0,
+        "hit_names": hits,
+        "min_score": min_score,
+        "settle_days": settle_days,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Weekly-rollup helpers
+# ---------------------------------------------------------------------------
+def top_movers(days: int = 7, limit: int = 8, db_path: Path | str = DEFAULT_DB_PATH) -> list[dict]:
+    """Companies with the biggest score change across the window (first vs last seen)."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT LOWER(c.name) AS name_lc, c.name AS name, r.run_at, c.score_total
+            FROM companies c JOIN runs r ON r.id = c.run_id
+            WHERE r.run_at >= datetime('now', ?)
+            ORDER BY r.run_at ASC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+    grouped: dict[str, list] = {}
+    for row in rows:
+        grouped.setdefault(row["name_lc"], []).append(row)
+    movers: list[dict] = []
+    for recs in grouped.values():
+        if len(recs) < 2:
+            continue
+        delta = round(recs[-1]["score_total"] - recs[0]["score_total"], 1)
+        if delta == 0:
+            continue
+        movers.append({
+            "name": recs[-1]["name"],
+            "delta": delta,
+            "first_score": recs[0]["score_total"],
+            "last_score": recs[-1]["score_total"],
+        })
+    movers.sort(key=lambda m: abs(m["delta"]), reverse=True)
+    return movers[:limit]
+
+
+def new_entrants(days: int = 7, db_path: Path | str = DEFAULT_DB_PATH) -> list[dict]:
+    """Companies whose first-ever KB appearance falls within the window."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT c.name AS name, MIN(r.run_at) AS first_seen,
+                   MAX(c.score_total) AS best_score
+            FROM companies c JOIN runs r ON r.id = c.run_id
+            GROUP BY LOWER(c.name)
+            HAVING first_seen >= datetime('now', ?)
+            ORDER BY best_score DESC
+            """,
+            (f"-{days} days",),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def count_runs(days: int = 7, db_path: Path | str = DEFAULT_DB_PATH) -> int:
+    """Number of recorded runs in the window."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM runs WHERE run_at >= datetime('now', ?)",
+            (f"-{days} days",),
+        ).fetchone()
+        return row["n"]

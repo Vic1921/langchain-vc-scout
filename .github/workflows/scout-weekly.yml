@@ -1,22 +1,21 @@
-name: VC Scout — urgent intra-day
+name: VC Scout — weekly rollup
 
 on:
   schedule:
-    # Every hour, Mon-Fri during European business hours (07:00-19:00 UTC).
-    # Cheap path: only fires URGENT alerts (watchlist hit + funding signal).
-    - cron: "0 7-19 * * 1-5"
+    # 07:00 UTC Monday — the LP-grade synthesis to open the week with.
+    - cron: "0 7 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # Shared with daily / weekly so KB writes serialize — see scout-daily.yml.
+  # Shared with daily / urgent so KB reads see a consistent file.
   group: vc-scout
   cancel-in-progress: false
 
 jobs:
-  scout-urgent:
+  rollup:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
@@ -46,24 +45,23 @@ jobs:
             mkdir -p data
             git show origin/reports:data/vc_scout.db > data/vc_scout.db 2>/dev/null \
               && echo "seeded KB from reports branch" \
-              || { rm -f data/vc_scout.db; echo "no prior KB — starting fresh"; }
+              || { rm -f data/vc_scout.db; echo "no prior KB — rollup will be sparse"; }
           fi
 
-      - name: Run scout — urgent only
+      # The rollup is pure-data (no LLM call), so it needs no ANTHROPIC_API_KEY.
+      - name: Build weekly rollup
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WATCHLIST_CSV: ${{ secrets.WATCHLIST_CSV }}
-        run: python -m src.main --urgent
+        run: python -m src.main --weekly
 
-      # The KB must be saved back, not just restored — the sent_alerts dedup
-      # ledger written this run is what stops the next hourly run re-sending
-      # the same urgent alert.
-      - name: Save knowledge base cache
+      - name: Upload rollup artifact
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/upload-artifact@v4
         with:
-          path: data/vc_scout.db
-          key: vc-scout-kb-${{ github.run_id }}
+          name: vc-scout-weekly-${{ github.run_id }}
+          path: outputs/
+          if-no-files-found: warn
+          retention-days: 90

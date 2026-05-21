@@ -25,20 +25,27 @@ from src.alerts import (
     find_urgent,
     has_funding_signal,
     load_watchlist,
+    match_watchlist,
     theme_spike_dedup_key,
     urgent_dedup_key,
 )
 from src.costs import compute_cost, extract_cost
+from src.matching import close_match, normalize_name
 from src.schema import ScoredCompany, VCScoutOutput
 from src.storage import (
     company_timeline,
     compute_conviction_deltas,
+    count_runs,
+    hit_rate,
     mark_alert_sent,
     monthly_cost,
+    new_entrants,
     recent_high_scorers,
     record_cost,
     record_run,
+    suggest_watchlist,
     theme_velocity,
+    top_movers,
     was_alert_sent,
 )
 
@@ -173,6 +180,32 @@ def main() -> int:
             del os.environ["WATCHLIST_CSV"]
         assert load_watchlist(path=db.parent / "nonexistent.csv") == [], "absent watchlist should be empty"
         print("OK  load_watchlist: WATCHLIST_CSV env path + graceful absence")
+
+        # --- Name matching + watchlist aliasing -----------------------------
+        assert normalize_name("Mistral AI") == normalize_name("Mistral"), "AI suffix should normalize away"
+        assert close_match("helsing", ["helsing", "pigment"]) == "helsing"
+        wl_alias = [WatchlistEntry(name="Mistral AI", thesis_tag="eu-ai", note="", aliases=("Mistral",))]
+        assert match_watchlist("Mistral", wl_alias) is not None, "'Mistral' should resolve to the 'Mistral AI' entry"
+        assert match_watchlist("Totally Unrelated Co", wl_alias) is None, "an unrelated name must not match"
+        print("OK  matching: normalization + close-match + watchlist aliasing")
+
+        # --- Conviction trend ------------------------------------------------
+        trend = compute_conviction_deltas([_company("Helsing", (10, 10, 10, 9, 10))], db_path=db)["helsing"].trend
+        assert trend in ("rising", "flat", "volatile", "cooling"), f"unexpected trend {trend!r}"
+        print(f"OK  conviction trend: classified as '{trend}'")
+
+        # --- KB rollup queries ----------------------------------------------
+        assert count_runs(days=7, db_path=db) == 2, "two runs were recorded this week"
+        suggestions = suggest_watchlist(set(), min_appearances=2, min_avg_score=7.0, db_path=db)
+        assert any(s["name"].lower() == "helsing" for s in suggestions), "recurring Helsing should be suggested"
+        excluded = suggest_watchlist({normalize_name("Helsing")}, min_appearances=2, min_avg_score=7.0, db_path=db)
+        assert not any(s["name"].lower() == "helsing" for s in excluded), "a known company must be excluded"
+        hr = hit_rate(db_path=db)
+        assert "rate" in hr and "evaluated" in hr, "hit_rate must return a scorecard dict"
+        print(
+            f"OK  rollup queries: {len(suggestions)} suggestion(s), "
+            f"{len(top_movers(db_path=db))} mover(s), {len(new_entrants(db_path=db))} entrant(s)"
+        )
 
         print("\nAll smoke checks passed.")
         return 0
