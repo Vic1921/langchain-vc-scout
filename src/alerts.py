@@ -6,9 +6,9 @@ Three tiers, ranked by how much they ought to interrupt a partner's day:
 2. THEME-SPIKE  — a tracked theme's mention count crosses 2x its 7-day baseline.
 3. DAILY DIGEST — the regular morning brief.
 
-If TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID are unset the module is a no-op so
-local runs stay quiet. Logging the would-have-sent message is on purpose —
-useful for debugging the workflow without spamming the chat.
+If no sink (Telegram or Slack) is configured the module is a no-op so local
+runs stay quiet. Logging the would-have-sent message is on purpose — useful
+for debugging the workflow without spamming the chat.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from pathlib import Path
 
 import requests
 
+from .matching import close_match, normalize_name
 from .schema import ScoredCompany, VCScoutOutput
 from .storage import ConvictionDelta, theme_velocity
 
@@ -49,6 +50,7 @@ class WatchlistEntry:
     name: str
     thesis_tag: str
     note: str
+    aliases: tuple[str, ...] = ()
 
 
 def load_watchlist(path: Path | str = DEFAULT_WATCHLIST_PATH) -> list[WatchlistEntry]:
@@ -72,17 +74,26 @@ def load_watchlist(path: Path | str = DEFAULT_WATCHLIST_PATH) -> list[WatchlistE
 
 
 def _parse_watchlist(handle) -> list[WatchlistEntry]:
-    """Parse watchlist rows from any text handle. Columns: name, thesis_tag, note."""
+    """Parse watchlist rows from any text handle.
+
+    Columns: name, aliases, thesis_tag, note. `aliases` is an optional
+    semicolon-separated list of alternate names; column order is irrelevant
+    and a missing `aliases` column is fine (older watchlists still parse).
+    """
     entries: list[WatchlistEntry] = []
     for row in csv.DictReader(handle):
         name = (row.get("name") or "").strip()
         if not name:
             continue
+        aliases = tuple(
+            a.strip() for a in (row.get("aliases") or "").split(";") if a.strip()
+        )
         entries.append(
             WatchlistEntry(
                 name=name,
                 thesis_tag=(row.get("thesis_tag") or "").strip(),
                 note=(row.get("note") or "").strip(),
+                aliases=aliases,
             )
         )
     return entries
@@ -97,17 +108,49 @@ def has_funding_signal(company: ScoredCompany) -> bool:
     return any(verb in blob for verb in FUNDING_VERBS)
 
 
+def _watchlist_index(watchlist: list[WatchlistEntry]) -> dict[str, WatchlistEntry]:
+    """Map every normalized name + alias to its WatchlistEntry."""
+    index: dict[str, WatchlistEntry] = {}
+    for entry in watchlist:
+        for label in (entry.name, *entry.aliases):
+            key = normalize_name(label)
+            if key:
+                index.setdefault(key, entry)
+    return index
+
+
+def match_watchlist(
+    company_name: str,
+    watchlist: list[WatchlistEntry],
+    index: dict[str, WatchlistEntry] | None = None,
+) -> WatchlistEntry | None:
+    """Resolve a company name to a watchlist entry: normalized exact, then close match."""
+    if not watchlist:
+        return None
+    index = index if index is not None else _watchlist_index(watchlist)
+    norm = normalize_name(company_name)
+    hit = index.get(norm)
+    if hit:
+        return hit
+    near = close_match(norm, list(index.keys()))
+    return index.get(near) if near else None
+
+
 def find_urgent(
     output: VCScoutOutput,
     watchlist: list[WatchlistEntry],
 ) -> list[tuple[ScoredCompany, WatchlistEntry]]:
-    """Companies on the watchlist that surfaced today WITH a funding signal."""
+    """Companies on the watchlist that surfaced today WITH a funding signal.
+
+    Matching is normalized + alias-aware + close-match, so the model writing
+    "Mistral" still resolves to a "Mistral AI" watchlist entry.
+    """
     if not watchlist:
         return []
-    by_name = {w.name.lower(): w for w in watchlist}
+    index = _watchlist_index(watchlist)
     matches: list[tuple[ScoredCompany, WatchlistEntry]] = []
     for company in output.companies:
-        hit = by_name.get(company.name.lower())
+        hit = match_watchlist(company.name, watchlist, index)
         if hit and has_funding_signal(company):
             matches.append((company, hit))
     return matches
@@ -163,11 +206,10 @@ def _telegram_creds() -> tuple[str, str] | None:
     return token, chat
 
 
-def send_message(text: str, parse_mode: str = "Markdown") -> bool:
-    """POST a message to the configured Telegram chat. No-op if creds missing."""
+def _post_telegram(text: str, parse_mode: str) -> bool:
+    """POST to Telegram. Returns False (not an error) if creds are absent."""
     creds = _telegram_creds()
     if not creds:
-        logger.info("Telegram disabled (no TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID): %s", text[:140])
         return False
     token, chat = creds
     # Telegram caps messages at 4096 chars. Truncate gracefully.
@@ -181,6 +223,35 @@ def send_message(text: str, parse_mode: str = "Markdown") -> bool:
         logger.warning("Telegram send failed: %s %s", resp.status_code, resp.text[:200])
         return False
     return True
+
+
+def _post_slack(text: str) -> bool:
+    """POST to a Slack incoming webhook. Returns False if SLACK_WEBHOOK_URL is unset.
+
+    Slack mrkdwn shares *bold* / _italic_ syntax with Telegram Markdown, so the
+    same message body renders acceptably in both.
+    """
+    webhook = os.environ.get("SLACK_WEBHOOK_URL", "").strip()
+    if not webhook:
+        return False
+    resp = requests.post(webhook, json={"text": text}, timeout=15)
+    if not resp.ok:
+        logger.warning("Slack send failed: %s %s", resp.status_code, resp.text[:200])
+        return False
+    return True
+
+
+def send_message(text: str, parse_mode: str = "Markdown") -> bool:
+    """Deliver an alert to every configured sink (Telegram, Slack).
+
+    Returns True if at least one sink accepted it. With no sink configured it
+    logs the message and returns False — local runs stay quiet, CI stays
+    debuggable. New sinks (email, etc.) slot in here without touching callers.
+    """
+    delivered = any([_post_telegram(text, parse_mode), _post_slack(text)])
+    if not delivered:
+        logger.info("No alert sink configured (Telegram/Slack) — message: %s", text[:140])
+    return delivered
 
 
 def send_urgent_alert(
@@ -216,6 +287,7 @@ def send_daily_digest(
     report_path: str | None,
     deltas: dict[str, ConvictionDelta] | None = None,
     monthly: dict | None = None,
+    suggestions: list[dict] | None = None,
 ) -> bool:
     deltas = deltas or {}
     top = sorted(output.companies, key=lambda c: c.score_total, reverse=True)[:5]
@@ -243,6 +315,10 @@ def send_daily_digest(
             f"${monthly['cost']:.2f} · {monthly['runs']} run(s) · "
             f"{monthly['input_tokens']:,} in / {monthly['output_tokens']:,} out tokens\n"
         )
+    if suggestions:
+        names = ", ".join(s["name"] for s in suggestions[:3])
+        more = f" +{len(suggestions) - 3} more" if len(suggestions) > 3 else ""
+        text += f"\n💡 Recurring & off-watchlist: {names}{more} — run --suggest-watchlist\n"
     if report_path:
         text += f"\nFull report: `{report_path}`"
     return send_message(text)

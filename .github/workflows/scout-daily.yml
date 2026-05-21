@@ -10,7 +10,9 @@ permissions:
   contents: write   # required to commit the SQLite KB + reports back to the reports branch
 
 concurrency:
-  group: scout-daily
+  # Shared across daily / urgent / weekly so KB writes never overlap and
+  # clobber each other — the runs serialize, which keeps memory compounding.
+  group: vc-scout
   cancel-in-progress: false
 
 jobs:
@@ -36,11 +38,23 @@ jobs:
           key: vc-scout-kb-${{ github.run_id }}
           restore-keys: vc-scout-kb-
 
+      - name: Seed KB from reports branch if the cache missed
+        run: |
+          if [ ! -f data/vc_scout.db ]; then
+            echo "cache miss — trying the durable reports branch"
+            git fetch origin reports --depth 1 2>/dev/null || true
+            mkdir -p data
+            git show origin/reports:data/vc_scout.db > data/vc_scout.db 2>/dev/null \
+              && echo "seeded KB from reports branch" \
+              || { rm -f data/vc_scout.db; echo "no prior KB — starting fresh"; }
+          fi
+
       - name: Run scout
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WATCHLIST_CSV: ${{ secrets.WATCHLIST_CSV }}
         run: python -m src.main
 

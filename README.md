@@ -23,9 +23,17 @@ Outputs:
 - Timestamped Markdown report in `outputs/`
 - One-page PDF for every company scoring ≥ 7.5/10 (in `outputs/onepagers/`)
 - SQLite knowledge base in `data/vc_scout.db` — company timelines, theme velocity, alert ledger, and cost ledger accumulate across runs
-- **Conviction delta** on every company — how today's score moved vs the last time the KB saw it (e.g. `8.6 → 9.1 ↑ +0.5`)
-- Tiered Telegram alerts: daily digest, theme-spike, and an **urgent** ping when a watchlist company appears with a funding signal. Urgent alerts are deduplicated, so the hourly cron never re-sends the same signal
+- **Conviction delta + trend** on every company — how today's score moved vs the KB, and whether it's `rising`, `cooling`, or `volatile` over the last few runs
+- Tiered alerts to **Telegram and/or Slack**: daily digest, theme-spike, and an **urgent** ping when a watchlist company appears with a funding signal. Urgent alerts are deduplicated, so the hourly cron never re-sends the same signal
 - A **cost ledger** — token spend per run, summarized as month-to-date spend in the daily digest
+
+The knowledge base is not write-only — it feeds back into the scout:
+- **Watchlist auto-suggest** — companies the KB keeps surfacing that you don't yet track
+- **Hit-rate scorecard** — of the companies scored 8+, how many later raised (`--hit-rate`)
+- **Weekly LP-grade rollup** — theme heat-map, conviction movers, new entrants, hit-rate (`--weekly`)
+- **Inbound-deal triage** — score any pasted company on the same rubric, with KB comparables (`--triage`)
+
+Watchlist matching is alias-aware and normalized, so the model writing "Mistral" still resolves to a "Mistral AI" watchlist entry.
 
 ---
 
@@ -78,24 +86,29 @@ The agent uses **LangGraph's `InMemorySaver`** as a checkpointer (per-run isolat
 ```
 langchain-vc-scout/
 ├── src/
-│   ├── main.py          # CLI entry point (full run, --urgent, --timeline, --theme-velocity, --cost)
+│   ├── main.py          # CLI entry point — full run, --urgent, --weekly, --triage, --hit-rate, …
 │   ├── agent.py         # Scraper tool (resilient) + system prompt + model + agent wiring
-│   ├── schema.py        # Pydantic models (VCScoutOutput, ScoredCompany, QualityGrade)
+│   ├── schema.py        # Pydantic models (VCScoutOutput, ScoredCompany, QualityGrade, TriageVerdict)
 │   ├── sources.py       # Default source URL list (US + EU mix)
+│   ├── matching.py      # Company-name normalization + close-match (watchlist aliasing)
 │   ├── storage.py       # SQLite KB — runs, companies, themes, conviction, alert + cost ledgers
-│   ├── alerts.py        # Watchlist + Telegram tiered alerts + dedup keys
+│   ├── alerts.py        # Watchlist matching + tiered alerts + pluggable sinks (Telegram, Slack)
 │   ├── reports.py       # Markdown + reportlab PDF one-pager
+│   ├── rollup.py        # Weekly LP-grade rollup (theme heat-map, movers, hit-rate, suggestions)
+│   ├── triage.py        # Inbound-deal triage against the rubric + KB comparables
 │   ├── costs.py         # Token-usage pricing + the cost ledger
 │   └── grading.py       # Haiku self-grading pass + regeneration prompt
 ├── scripts/
-│   └── smoke_storage.py # LLM-free end-to-end test of storage / alert / cost layers
+│   ├── smoke_storage.py # LLM-free end-to-end test of storage / alert / matching / cost layers
+│   └── telegram_setup.py # One-time Telegram wiring helper
 ├── .github/workflows/
-│   ├── scout-daily.yml  # Mon–Fri 06:00 UTC — full run + digest, KB cached
-│   └── scout-urgent.yml # Mon–Fri hourly — urgent-only intra-day pass
+│   ├── scout-daily.yml  # Mon–Fri 06:00 UTC — full run + digest
+│   ├── scout-urgent.yml # Mon–Fri hourly — urgent-only intra-day pass
+│   └── scout-weekly.yml # Monday 07:00 UTC — LP-grade weekly rollup
 ├── outputs/             # Auto-generated reports + PDF one-pagers (git-ignored)
-├── data/                # SQLite KB (git-ignored locally; cached on CI)
+├── data/                # SQLite KB (git-ignored locally; cached + branch-mirrored on CI)
 ├── watchlist.csv        # Your private watchlist (git-ignored)
-├── watchlist.example.csv # Public template
+├── watchlist.example.csv # Public template (name, aliases, thesis_tag, note)
 ├── .env                 # Your API keys — never committed
 ├── .env.example         # Safe template to share
 ├── requirements.txt     # Python dependencies
@@ -154,6 +167,19 @@ python -m src.main --theme-velocity
 
 # Print the month-to-date cost ledger
 python -m src.main --cost
+
+# Build the LP-grade weekly rollup (theme heat-map, movers, hit-rate, suggestions)
+python -m src.main --weekly
+
+# Conviction hit-rate scorecard — did the 8+ calls play out?
+python -m src.main --hit-rate
+
+# Companies the KB keeps surfacing that aren't on your watchlist yet
+python -m src.main --suggest-watchlist
+
+# Triage an inbound company against the rubric + KB comparables (text or a file path)
+python -m src.main --triage "Berlin seed-stage AI agent infra startup, ex-DeepMind founders, €4M pre-seed"
+python -m src.main --triage path/to/deck-summary.txt
 
 # Override the source list ad hoc
 python -m src.main --sources https://sifted.eu https://techcrunch.com/category/artificial-intelligence/

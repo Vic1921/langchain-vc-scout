@@ -102,3 +102,37 @@ class QualityGrade(BaseModel):
             "claims, or company rationales missing [source: <url>] citations"
         ),
     )
+
+
+class TriageVerdict(BaseModel):
+    """Result of triaging an inbound company against the scout's rubric (see triage.py)."""
+
+    company: str = Field(description="Company name")
+    score_market: int = Field(ge=1, le=10, description="Market potential, 1-10")
+    score_team: int = Field(ge=1, le=10, description="Team strength, 1-10")
+    score_product: int = Field(ge=1, le=10, description="Product innovation, 1-10")
+    score_defensibility: int = Field(ge=1, le=10, description="Defensibility / moat, 1-10")
+    score_interest: int = Field(ge=1, le=10, description="Investor-interest signal, 1-10")
+    rationale: str = Field(description="2-4 sentences justifying the scores, concrete and skeptical")
+    regulatory_tag: str = Field(description="EU regulatory exposure (AI Act / DORA / MiCA / NIS2 / GDPR) or 'low'")
+    sovereignty_tag: str = Field(description="EU strategic-autonomy thesis fit, or 'none'")
+    recommendation: str = Field(description="One of: pursue, track, pass")
+    comparables: list[str] = Field(
+        default_factory=list,
+        description="Closest companies drawn ONLY from the provided knowledge-base list",
+    )
+    comparables_note: str = Field(description="How the inbound company compares to those names")
+
+    @property
+    def score_total(self) -> float:
+        return round(
+            (
+                self.score_market
+                + self.score_team
+                + self.score_product
+                + self.score_defensibility
+                + self.score_interest
+            )
+            / 5.0,
+            1,
+        )
