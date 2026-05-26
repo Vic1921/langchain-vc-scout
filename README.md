@@ -237,6 +237,29 @@ gh secret set WATCHLIST_CSV      --repo <owner>/<repo> < watchlist.csv
 
 ---
 
+## Cost controls
+
+The scout's spend is roughly: a daily Sonnet run (~$0.05) plus a few urgent Haiku runs (~$0.01 each). Three knobs keep that bounded:
+
+| Lever | Where | Effect |
+|---|---|---|
+| `COST_BUDGET_USD` | env var / repo `vars` | Hard cap. If month-to-date spend (see `--cost`) reaches it, runs no-op until next month. |
+| `SCOUT_URGENT_MODEL` | env var | Defaults to Haiku 4.5 (~3× cheaper than Sonnet). Set to anything `init_chat_model` accepts. |
+| `SCOUT_MAIN_MODEL` | env var | Defaults to Sonnet 4.6. Switch the daily run to Haiku for an emergency-cheap month. |
+
+Cron cadence is the other lever: `scout-urgent.yml` is set to 3×/day during European business hours (08/13/17 UTC). Edit the cron line for fewer / more checks. The daily and weekly schedules are already minimal.
+
+To pause everything without touching code:
+
+```bash
+gh workflow disable scout-daily.yml  --repo <owner>/<repo>
+gh workflow disable scout-urgent.yml --repo <owner>/<repo>
+gh workflow disable scout-weekly.yml --repo <owner>/<repo>
+# ...and `gh workflow enable` to bring them back.
+```
+
+---
+
 ## Deploying
 
 Every input is configurable by environment variable, so the scout runs the same way on a laptop, a server, a container, or CI.

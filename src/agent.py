@@ -6,6 +6,8 @@ they actually use: cross-source synthesis, regulatory tags, vintage matches,
 a contrarian pass, and source-cited rationales.
 """
 
+import os
+
 import requests
 from bs4 import BeautifulSoup
 
@@ -16,6 +18,9 @@ from langchain.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 
 from .schema import VCScoutOutput
+
+
+DEFAULT_MODEL_ID = "claude-sonnet-4-6"
 
 
 SYSTEM_PROMPT = """
@@ -80,12 +85,17 @@ def scrape_headlines(url: str) -> str:
     return f"=== SOURCE: {url} ===\n{body}"
 
 
-def build_agent():
-    """Compose the chat model, tools, structured output, and in-memory checkpointer."""
+def build_agent(model_id: str | None = None, max_tokens: int = 4000):
+    """Compose the chat model, tools, structured output, and in-memory checkpointer.
+
+    `model_id` priority: explicit argument > SCOUT_MAIN_MODEL env var > the
+    Sonnet default. The urgent path passes Haiku for ~3x cheaper runs.
+    """
+    model_id = model_id or os.environ.get("SCOUT_MAIN_MODEL") or DEFAULT_MODEL_ID
     model = init_chat_model(
-        "claude-sonnet-4-6",
+        model_id,
         temperature=0.3,
-        max_tokens=4000,
+        max_tokens=max_tokens,
         timeout=90,
     )
     checkpointer = InMemorySaver()
