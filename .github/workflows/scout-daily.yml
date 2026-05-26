@@ -56,6 +56,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WATCHLIST_CSV: ${{ secrets.WATCHLIST_CSV }}
+          COST_BUDGET_USD: ${{ vars.COST_BUDGET_USD }}
+          SCOUT_MAIN_MODEL: ${{ vars.SCOUT_MAIN_MODEL }}
         run: python -m src.main
 
       - name: Save knowledge base cache

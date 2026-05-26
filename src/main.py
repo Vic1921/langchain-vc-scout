@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,7 +113,26 @@ def _fire_urgent(output, deltas, label: str) -> int:
 
 
 def run(urls: list[str], urgent_only: bool = False) -> int:
-    agent = build_agent()
+    # Hard monthly budget cap — if COST_BUDGET_USD is set and the month-to-date
+    # spend already exceeds it, this run no-ops. CLI queries (timeline, cost,
+    # hit-rate, etc.) still work because they don't go through this function.
+    budget = float(os.environ.get("COST_BUDGET_USD", "") or 0)
+    if budget > 0:
+        mtd = monthly_cost()["cost"]
+        if mtd >= budget:
+            log.warning(
+                "Month-to-date spend $%.2f >= COST_BUDGET_USD $%.2f — skipping run",
+                mtd, budget,
+            )
+            return -1
+
+    # Urgent path defaults to Haiku — ~3x cheaper than Sonnet, plenty for
+    # detecting funding signals on watchlist companies. Override via env vars.
+    if urgent_only:
+        urgent_model = os.environ.get("SCOUT_URGENT_MODEL") or "claude-haiku-4-5-20251001"
+        agent = build_agent(model_id=urgent_model, max_tokens=2500)
+    else:
+        agent = build_agent()
     config = {"configurable": {"thread_id": datetime.now().strftime("%Y%m%d_%H%M%S")}}
     costs: list[CostRecord] = []
 

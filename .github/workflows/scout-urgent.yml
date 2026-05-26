@@ -2,9 +2,10 @@ name: VC Scout — urgent intra-day
 
 on:
   schedule:
-    # Every hour, Mon-Fri during European business hours (07:00-19:00 UTC).
-    # Cheap path: only fires URGENT alerts (watchlist hit + funding signal).
-    - cron: "0 7-19 * * 1-5"
+    # 08 / 13 / 17 UTC Mon-Fri — three checks spanning the European business day.
+    # Was hourly; trimmed to 3x/day after a Haiku-powered urgent path made the
+    # bottleneck the schedule, not the model.
+    - cron: "0 8,13,17 * * 1-5"
   workflow_dispatch:
 
 permissions:
@@ -56,6 +57,8 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           WATCHLIST_CSV: ${{ secrets.WATCHLIST_CSV }}
+          COST_BUDGET_USD: ${{ vars.COST_BUDGET_USD }}
+          SCOUT_URGENT_MODEL: ${{ vars.SCOUT_URGENT_MODEL }}
         run: python -m src.main --urgent
 
       # The KB must be saved back, not just restored — the sent_alerts dedup
